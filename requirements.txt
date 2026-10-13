@@ -1,0 +1,6 @@
+dhanhq==2.2.0
+smartapi-python==1.5.5
+fyers-apiv3==3.1.17
+pyotp==2.9.0
+httpx==0.27.2
+# Note: asyncio is built into the Python 3.12 standard library
