@@ -675,6 +675,8 @@ class AngelOneAdapter(BaseAdapter):
         )
 
     async def place_order(self, order: Order) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("angelone.place_order")
         await rate_limiter.acquire("angelone")
         # Without a session the request cannot reach the exchange. Returning an OPEN
         # update here would report a phantom fill for an order that never left the
@@ -793,6 +795,8 @@ class AngelOneAdapter(BaseAdapter):
         )
 
     async def cancel_order(self, client_order_id: str, broker_order_id: Optional[str] = None) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("angelone.cancel_order")
         await rate_limiter.acquire("angelone")
         if self._smart_api and hasattr(self._smart_api, "cancelOrder") and broker_order_id:
             loop = asyncio.get_running_loop()
@@ -816,6 +820,8 @@ class AngelOneAdapter(BaseAdapter):
         price: Optional[float] = None,
         quantity: Optional[float] = None,
     ) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("angelone.modify_order")
         await rate_limiter.acquire("angelone")
         if self._smart_api and hasattr(self._smart_api, "modifyOrder") and broker_order_id:
             loop = asyncio.get_running_loop()

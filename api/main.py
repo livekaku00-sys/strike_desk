@@ -637,45 +637,12 @@ async def _auto_execute_loop() -> None:
                     broker = "paper"
                     order.metadata = dict(_identity)
                 else:
-                    # Hard-block: the order's broker field must still be the active
-                    # broker. broker was set from mgr.get_active_broker() above, so
-                    # this is normally a no-op, but it catches any race where the
-                    # active broker changed between the broker lookup and now.
-                    try:
-                        _require_active_broker(order.broker, broker)
-                    except Exception as _guard_exc:
-                        logger.critical("[AutoExec] DROPPED — broker isolation guard fired: %s", _guard_exc)
-                        continue
-                    from api.dependencies import service_container as _sc
-                    _all_adapters = _sc.get_broker_adapters() or {}
-                    try:
-                        adapter = _select_active_adapter(_all_adapters, broker)
-                    except Exception:
-                        logger.critical("[AutoExec] DROPPED — broker '%s' is not connected: %s %s",
-                                     broker, signal.symbol, side.value)
-                        continue
-                    if _is_option:
-                        # Only Dhan's resolver addresses an option by this contract
-                        # identity; handing it to any other broker would let that broker
-                        # place a real option order, which this system does not route.
-                        if broker != "dhan":
-                            logger.critical(
-                                "[AutoExec] DROPPED — LIVE option %s not sent: options route only "
-                                "via Dhan and the active broker is '%s'", order.symbol, broker)
-                            continue
-                        _missing = [k for k in _LIVE_OPTION_REQUIRED if not _identity.get(k)]
-                        if _missing:
-                            logger.critical(
-                                "[AutoExec] DROPPED — LIVE option %s has no resolved %s; refusing "
-                                "to send it", order.symbol, _missing)
-                            continue
-                        order.metadata = dict(_identity)
-                        logger.critical(
-                            "[AutoExec] LIVE option contract attached: %s underlying=%s expiry=%s "
-                            "strike=%s type=%s dhan_security_id=%s segment=%s",
-                            order.symbol, _identity["underlying"], _identity["selected_expiry"],
-                            _identity["selected_strike"], _identity["option_type"],
-                            _identity["dhan_security_id"], _identity.get("dhan_segment"))
+                    # Live order dispatch is permanently prohibited.
+                    # This branch can only be reached if ExecutionModeController.set()
+                    # is bypassed — the adapter-level guard provides a second layer.
+                    from utils.live_order_guard import prohibit_live_order
+                    prohibit_live_order("_auto_execute_loop: LIVE branch")
+                    continue  # unreachable; silences linter warnings about adapter unbound
                 try:
                     logger.critical(
                         "[PIPELINE TRACE] Junction 4 — Routing Order to %s: symbol=%s side=%s"

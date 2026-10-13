@@ -122,10 +122,19 @@ class ExecutionModeController:
 
     def set(self, mode: str) -> str:
         m = (mode or "").strip().upper()
-        if m not in (EXEC_PAPER, EXEC_LIVE):
+        if m == EXEC_LIVE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "LIVE execution mode is permanently disabled in this build. "
+                    "Live broker order dispatch is not supported. "
+                    "Only PAPER mode is available."
+                ),
+            )
+        if m != EXEC_PAPER:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid execution mode '{mode}'. Must be {EXEC_PAPER} or {EXEC_LIVE}.",
+                detail=f"Invalid execution mode '{mode}'. Only {EXEC_PAPER} is supported.",
             )
         previous, self.mode = self.mode, m
         if previous != m:
@@ -757,15 +766,12 @@ async def place_order(
         )
         active_broker = f"paper:{active_broker}"
     else:
-        # Use the authenticated adapter from the DI container. _select_active_adapter
-        # only returns the adapter keyed by active_broker — there is no way to obtain
-        # a different broker's adapter through this call path.
-        require_active_broker(order.broker, active_broker)
-        adapter = _select_active_adapter(adapters, active_broker)
-        logger.warning(
-            "[Orders] LIVE MODE — sending %s %s x%s to broker '%s' with real capital.",
-            order_req.side, order_req.symbol, order_req.quantity, active_broker,
-        )
+        # Live order dispatch is permanently prohibited. This branch can only be
+        # reached if ExecutionModeController.set() is bypassed directly — the
+        # adapter-level guard in each broker's place_order/cancel_order/modify_order
+        # provides a second layer of protection in that case.
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("place_order route: LIVE branch")
 
     try:
         logger.critical(
@@ -817,23 +823,7 @@ async def place_order(
         _positions_db.clear()
         for pos in get_paper_broker().get_positions_dict():
             _positions_db[pos["symbol"]] = pos
-    else:
-        # LIVE: sync positions from the broker so the "Open Positions" panel
-        # reflects the new position immediately after the fill, rather than
-        # staying empty until the next scheduled poll.
-        # Non-fatal: a transient broker API failure must never block the order
-        # confirmation — the order is already placed.
-        try:
-            if hasattr(adapter, "get_positions"):
-                live_positions = await adapter.get_positions()
-                _positions_db.clear()
-                for pos in live_positions:
-                    if pos.is_open:
-                        _positions_db[pos.symbol] = pos.to_dict()
-        except Exception as _pos_exc:
-            logger.warning(
-                "[Orders] LIVE position sync after fill failed (non-fatal): %s", _pos_exc
-            )
+    # No LIVE position sync — live order dispatch is permanently prohibited.
 
     # Book the fill into both risk stores, in units (lots × lot_size).
     record_fill_in_risk(order, update, oid, fill_price, order_cat)
@@ -910,7 +900,7 @@ async def list_positions(
 
 
 class ExecutionModeRequest(BaseModel):
-    mode: str = Field(..., description=f"{EXEC_PAPER} (virtual money) or {EXEC_LIVE} (real capital)")
+    mode: str = Field(..., description=f"Only {EXEC_PAPER} is supported. {EXEC_LIVE} is permanently disabled.")
 
 
 @router.get("/execution-mode")
@@ -920,11 +910,7 @@ async def get_exec_mode(exec_mode: ExecutionModeController = Depends(get_executi
     return {
         "execution_mode": exec_mode.get(),
         "is_paper": paper,
-        "description": (
-            "Real live market data, virtual money — no broker order API is called."
-            if paper else
-            "Real live market data, real capital — orders are sent to the broker."
-        ),
+        "description": "Real live market data, virtual money — no broker order API is called.",
     }
 
 
@@ -934,68 +920,7 @@ async def set_exec_mode(
     exec_mode: ExecutionModeController = Depends(get_execution_mode),
     _op: Dict[str, Any] = Depends(require_operator),
 ):
-    # Block arming LIVE mode when a manual-auth broker's token has expired.
-    # Fails-open on import error so an infrastructure issue never becomes a
-    # permanent lockout — the operator can still switch to LIVE if the
-    # scheduler service itself fails to load.
-    if (req.mode or "").strip().upper() == EXEC_LIVE:
-        try:
-            from services.token_scheduler import token_scheduler as _ts
-            blocked, reason = _ts.get_live_mode_block_reason()
-            if blocked:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        "LIVE MODE arming blocked: one or more broker tokens have expired. "
-                        f"{reason} "
-                        "Paste a fresh token via POST /api/v1/brokers/<broker>/reauth first."
-                    ),
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-        # Block arming LIVE mode when any CRITICAL pre-flight check has FAILED.
-        # Runs a fresh check on every LIVE-arm attempt — reading the cached report
-        # would allow stale PASS results (e.g. a market-hours check cached at 08:45)
-        # to persist into after-hours arming.  Fail-CLOSED: if the preflight service
-        # itself raises, the state is indeterminate and LIVE must not proceed.
-        # A PENDING result (PCR before 09:15 IST) is NOT a failure and does NOT block.
-        #
-        # CONCURRENCY NOTE: run_all() is synchronous and blocks the asyncio event loop
-        # while it runs.  No other coroutine can be scheduled between run_all() returning
-        # and exec_mode.set() below, so there is no TOCTOU race in the single-worker
-        # uvicorn/asyncio deployment.  Emergency halt is also enforced independently at
-        # place_order() time, bounding any theoretical race in multi-worker deployments.
-        try:
-            from services.preflight import preflight_engine as _pf
-            report = _pf.run_all()
-            if report.live_mode_blocked:
-                failed_names = [
-                    c.name for c in report.checks
-                    if c.severity == "CRITICAL" and c.status == "FAIL"
-                ]
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=(
-                        "LIVE MODE arming blocked: critical pre-flight check(s) failed: "
-                        f"{', '.join(failed_names) or 'unknown'}. "
-                        "Run GET /api/v1/preflight/status for details and remediate first."
-                    ),
-                )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "LIVE MODE arming blocked: pre-flight validation could not complete "
-                    f"({type(exc).__name__}). "
-                    "Investigate the preflight service and retry."
-                ),
-            )
-
+    # exec_mode.set() rejects EXEC_LIVE unconditionally — see ExecutionModeController.
     return {"execution_mode": exec_mode.set(req.mode), "is_paper": exec_mode.is_paper()}
 
 

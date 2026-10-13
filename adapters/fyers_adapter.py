@@ -594,6 +594,8 @@ class FyersAdapter(BaseAdapter):
         return chain.to_dict()
 
     async def place_order(self, order: Order) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("fyers.place_order")
         await rate_limiter.acquire("fyers")
         # Without a session the request cannot reach the exchange. Returning an
         # OrderUpdate here would report a phantom fill for an order that never left
@@ -696,6 +698,8 @@ class FyersAdapter(BaseAdapter):
         )
 
     async def cancel_order(self, client_order_id: str, broker_order_id: Optional[str] = None) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("fyers.cancel_order")
         await rate_limiter.acquire("fyers")
         if self._fyers_model and hasattr(self._fyers_model, "cancel_order") and broker_order_id:
             loop = asyncio.get_running_loop()
@@ -718,6 +722,8 @@ class FyersAdapter(BaseAdapter):
         price: Optional[float] = None,
         quantity: Optional[float] = None,
     ) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("fyers.modify_order")
         await rate_limiter.acquire("fyers")
         if self._fyers_model and hasattr(self._fyers_model, "modify_order") and broker_order_id:
             loop = asyncio.get_running_loop()

@@ -613,6 +613,8 @@ class DhanAdapter(BaseAdapter):
         )
 
     async def place_order(self, order: Order) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("dhan.place_order")
         await rate_limiter.acquire("dhan")
         # Without a client the request cannot reach the exchange. Returning an OPEN
         # update here would report a phantom fill for an order that never left the
@@ -730,6 +732,8 @@ class DhanAdapter(BaseAdapter):
         )
 
     async def cancel_order(self, client_order_id: str, broker_order_id: Optional[str] = None) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("dhan.cancel_order")
         await rate_limiter.acquire("dhan")
         if self._client and hasattr(self._client, "cancel_order") and broker_order_id:
             loop = asyncio.get_running_loop()
@@ -752,6 +756,8 @@ class DhanAdapter(BaseAdapter):
         price: Optional[float] = None,
         quantity: Optional[float] = None,
     ) -> OrderUpdate:
+        from utils.live_order_guard import prohibit_live_order
+        prohibit_live_order("dhan.modify_order")
         await rate_limiter.acquire("dhan")
         if self._client and hasattr(self._client, "modify_order") and broker_order_id:
             # Callers count quantity in lots, but Dhan counts units, and this method
