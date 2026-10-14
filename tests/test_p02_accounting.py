@@ -10,6 +10,7 @@ Covers:
 All tests are isolated and never modify production data paths.
 Safety invariant: no live order path is tested or altered.
 """
+import asyncio
 import sys
 import types
 import unittest
@@ -667,6 +668,219 @@ class TestBreakevenExitCharges(unittest.TestCase):
         self.assertGreater(trade.charges, 0.0,
             "Breakeven equity exit must produce non-zero charges")
         self.assertLess(trade.net_pnl, 0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Part F — End-to-end breakeven exit regression (S03-CLOSEOUT)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBreakevenExitEndToEnd(unittest.TestCase):
+    """
+    End-to-end regression for DEFECT-1: exercises the FULL lifecycle from
+    PaperBrokerAdapter.place_order() through metadata["position_closed"] into
+    record_fill_in_risk() charges.
+
+    Unlike TestBreakevenExitCharges (Part E) which injects position_closed
+    directly into a mock metadata dict, these tests instantiate the real
+    PaperBrokerAdapter, open a position via place_order(), close it at various
+    prices, and verify the broker itself sets position_closed correctly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if _TRADING_MOD is None:
+            raise unittest.SkipTest("api.routes.trading could not be loaded — skipping")
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _make_broker(self, price: float, symbol: str = "RELIANCE"):
+        from adapters.paper_broker import PaperBrokerAdapter
+        prices = {symbol.upper(): price}
+        return PaperBrokerAdapter(ltp_provider=lambda s: prices.get(s.upper()))
+
+    def _make_order(self, symbol, side_str, qty, price, cid="TEST-001"):
+        from models.order import Order, OrderSide, OrderType
+        return Order(
+            client_order_id=cid,
+            symbol=symbol,
+            exchange="NSE",
+            side=OrderSide.BUY if side_str == "BUY" else OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=float(qty),
+            price=float(price),
+            broker="paper",
+        )
+
+    def _call_record_fill(self, order, update, order_id, fill_price, category):
+        captured = {}
+        mock_rm = MagicMock()
+        mock_rm.apply_fill.return_value = 0.0
+        mock_rm.get_risk_summary.return_value = {
+            "trade_count": 0, "open_positions_count": 0,
+            "realized_pnl": 0.0, "total_risk_pnl": 0.0,
+        }
+        mock_cb = MagicMock()
+        def capture_trade(trade):
+            captured["trade"] = trade
+        mock_cb.on_trade_completed.side_effect = capture_trade
+        with patch.dict("sys.modules", {
+            "risk.risk_manager": MagicMock(risk_manager=mock_rm),
+            "risk.circuit_breaker": MagicMock(circuit_breaker=mock_cb),
+        }):
+            _TRADING_MOD.record_fill_in_risk(order, update, order_id, fill_price, category)
+        return captured.get("trade")
+
+    # ── tests ────────────────────────────────────────────────────────────────
+
+    def test_opening_fill_position_closed_false(self):
+        """
+        Opening fill: PaperBrokerAdapter must set position_closed=False
+        in the returned OrderUpdate metadata (no prior position exists).
+        """
+        symbol = "RELIANCE"
+        price = 2500.0
+        pb = self._make_broker(price, symbol)
+        order = self._make_order(symbol, "BUY", qty=10, price=price, cid="E2E-OPEN-001")
+
+        upd = asyncio.run(pb.place_order(order))
+
+        self.assertEqual(upd.state.value, "FILLED")
+        self.assertFalse(upd.metadata.get("position_closed"),
+            "Opening fill must NOT set position_closed=True")
+        self.assertEqual(upd.metadata.get("realized_pnl"), 0.0,
+            "Opening fill realized_pnl must be 0.0")
+
+    def test_breakeven_close_sets_position_closed_true(self):
+        """
+        Core broker-layer test: close a position at exactly its entry price.
+        PaperBrokerAdapter must set position_closed=True and realized_pnl==0.0
+        in the closing OrderUpdate metadata.
+        """
+        symbol = "RELIANCE"
+        entry_price = 2500.0
+        qty = 10
+        pb = self._make_broker(entry_price, symbol)
+
+        # Open
+        buy_order = self._make_order(symbol, "BUY", qty=qty, price=entry_price, cid="E2E-BUY-001")
+        asyncio.run(pb.place_order(buy_order))
+
+        pos = pb.positions[symbol.upper()]
+        self.assertEqual(pos.quantity, float(qty))
+        self.assertAlmostEqual(pos.avg_price, entry_price)
+
+        # Close at EXACTLY entry price
+        sell_order = self._make_order(symbol, "SELL", qty=qty, price=entry_price, cid="E2E-SELL-001")
+        close_upd = asyncio.run(pb.place_order(sell_order))
+
+        # Broker must evict the position (breakeven close)
+        self.assertNotIn(symbol.upper(), pb.positions,
+            "Breakeven close must remove position from self.positions")
+
+        # Broker must set the flag
+        self.assertTrue(close_upd.metadata.get("position_closed"),
+            "Breakeven close metadata must have position_closed=True")
+        self.assertEqual(close_upd.metadata.get("realized_pnl"), 0.0,
+            "Breakeven close metadata must have realized_pnl==0.0")
+
+    def test_breakeven_close_end_to_end_charges_and_net_pnl(self):
+        """
+        Definitive end-to-end regression for DEFECT-1:
+        PaperBrokerAdapter breakeven close → record_fill_in_risk() →
+        charges > 0, net_pnl = -charges.
+
+        Uses ChargeCalculator directly to derive the expected charge so no
+        hard-coded fee estimate is needed.
+        """
+        from risk.charge_calculator import ChargeCalculator
+        symbol = "RELIANCE"
+        entry_price = 2500.0
+        qty = 10
+        pb = self._make_broker(entry_price, symbol)
+
+        # Open
+        buy_order = self._make_order(symbol, "BUY", qty=qty, price=entry_price, cid="E2E-BUY-002")
+        asyncio.run(pb.place_order(buy_order))
+
+        # Close at entry price
+        sell_order = self._make_order(symbol, "SELL", qty=qty, price=entry_price, cid="E2E-SELL-002")
+        close_upd = asyncio.run(pb.place_order(sell_order))
+
+        # Verify broker-layer flag before calling risk path
+        self.assertTrue(close_upd.metadata.get("position_closed"))
+        self.assertEqual(close_upd.metadata.get("realized_pnl"), 0.0)
+
+        # Derive expected charges deterministically from ChargeCalculator
+        lot_size = close_upd.metadata.get("lot_size", 1)
+        units = int(round(float(sell_order.quantity) * lot_size))
+        turnover = float(units) * entry_price
+        expected_charges = ChargeCalculator.calculate_total_charges(
+            turnover=turnover,
+            trade_type="INTRADAY",
+            segment="EQUITY",
+            is_sell=True,
+        )
+        self.assertGreater(expected_charges, 0.0)
+
+        # Pass through record_fill_in_risk()
+        trade = self._call_record_fill(
+            sell_order, close_upd, "E2E-SELL-002", entry_price, "EQUITY"
+        )
+
+        self.assertIsNotNone(trade, "Trade must be captured from circuit breaker")
+        self.assertAlmostEqual(trade.charges, expected_charges, places=4,
+            msg="Recorded charges must match ChargeCalculator output exactly")
+        self.assertEqual(trade.realized_pnl, 0.0)
+        self.assertLess(trade.net_pnl, 0.0,
+            "Breakeven exit net_pnl must be negative (exchange charges apply)")
+        self.assertAlmostEqual(trade.net_pnl, -expected_charges, places=4,
+            msg="net_pnl must equal -charges for a breakeven exit")
+
+    def test_profitable_close_position_closed_true(self):
+        """
+        Profitable full close: position_closed=True must be set even when
+        realized P&L > 0. Confirms no regression in the normal exit path.
+        """
+        symbol = "RELIANCE"
+        entry_price = 2500.0
+        exit_price = 2600.0
+        qty = 10
+        pb = self._make_broker(entry_price, symbol)
+
+        buy_order = self._make_order(symbol, "BUY", qty=qty, price=entry_price, cid="E2E-BUY-003")
+        asyncio.run(pb.place_order(buy_order))
+
+        # Update ltp to exit price
+        pb._ltp_provider = lambda s: {"RELIANCE": exit_price}.get(s.upper())
+        sell_order = self._make_order(symbol, "SELL", qty=qty, price=exit_price, cid="E2E-SELL-003")
+        close_upd = asyncio.run(pb.place_order(sell_order))
+
+        self.assertTrue(close_upd.metadata.get("position_closed"),
+            "Profitable full close must also set position_closed=True")
+        expected_realized = (exit_price - entry_price) * qty * 1  # lot_size=1 for equity
+        self.assertAlmostEqual(close_upd.metadata.get("realized_pnl"), expected_realized, places=4)
+
+    def test_partial_close_position_closed_false(self):
+        """
+        Partial close: position_closed=False (position still open after fill).
+        Ensures the flag is not incorrectly set for partial reductions.
+        """
+        symbol = "RELIANCE"
+        price = 2500.0
+        pb = self._make_broker(price, symbol)
+
+        buy_order = self._make_order(symbol, "BUY", qty=10, price=price, cid="E2E-BUY-004")
+        asyncio.run(pb.place_order(buy_order))
+
+        # Sell only 5 of the 10 lots
+        sell_order = self._make_order(symbol, "SELL", qty=5, price=price, cid="E2E-SELL-004")
+        partial_upd = asyncio.run(pb.place_order(sell_order))
+
+        self.assertFalse(partial_upd.metadata.get("position_closed"),
+            "Partial close must NOT set position_closed=True")
+        pos = pb.positions.get(symbol.upper())
+        self.assertIsNotNone(pos)
+        self.assertEqual(pos.quantity, 5.0)
 
 
 if __name__ == "__main__":
