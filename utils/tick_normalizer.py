@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import logging
 import math
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from models.tick import Tick
 
 
@@ -45,6 +45,64 @@ def _parse_timestamp(raw_time: Any) -> datetime:
         except Exception:
             pass
     return datetime.now(timezone.utc)
+
+
+def _parse_timestamp_with_unit(
+    raw_time: Any,
+    expect_ms: bool,
+    broker: str = "",
+) -> Tuple[datetime, bool]:
+    """
+    Parse a broker timestamp with an explicit, documented epoch unit.
+
+    Returns (utc_datetime, synthetic) where synthetic=True means the exchange
+    timestamp was absent or unparseable and local receipt time was substituted.
+    Callers should set source="receipt_time" on the Tick when synthetic is True
+    so downstream consumers can distinguish event time from receipt time.
+
+    Parameters
+    ----------
+    raw_time : Any
+        Raw timestamp value from the broker payload.
+    expect_ms : bool
+        True when the broker documents epoch values as milliseconds (e.g. AngelOne).
+        False when epoch values are seconds (e.g. Dhan LTT, Fyers exch_feed_time).
+    broker : str
+        Broker name for log messages; does not affect parsing logic.
+    """
+    if raw_time is None:
+        logger.warning(
+            "[%s] Missing timestamp field; substituting local receipt time (UTC). "
+            "Downstream freshness checks may be inaccurate.",
+            broker or "broker",
+        )
+        return datetime.now(timezone.utc), True
+
+    if isinstance(raw_time, datetime):
+        if raw_time.tzinfo is None:
+            return raw_time.replace(tzinfo=timezone.utc), False
+        return raw_time.astimezone(timezone.utc), False
+
+    if isinstance(raw_time, (int, float)):
+        epoch_s = raw_time / 1000.0 if expect_ms else float(raw_time)
+        return datetime.fromtimestamp(epoch_s, tz=timezone.utc), False
+
+    if isinstance(raw_time, str):
+        try:
+            dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc), False
+        except Exception:
+            pass
+
+    logger.warning(
+        "[%s] Unparseable timestamp %r; substituting local receipt time (UTC). "
+        "Verify broker payload timestamp field and format.",
+        broker or "broker",
+        raw_time,
+    )
+    return datetime.now(timezone.utc), True
 
 
 def detect_instrument_type(symbol: str) -> str:
@@ -94,7 +152,11 @@ class TickNormalizer:
         ask_price = float(asks[0].get("price", 0.0)) if asks and isinstance(asks[0], dict) else float(raw.get("ask", 0.0) or 0.0)
         ask_qty = float(asks[0].get("quantity", 0.0)) if asks and isinstance(asks[0], dict) else float(raw.get("ask_qty", 0.0) or 0.0)
 
-        ts = _parse_timestamp(raw.get("LTT") or raw.get("exchange_timestamp") or raw.get("timestamp"))
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("LTT") or raw.get("exchange_timestamp") or raw.get("timestamp"),
+            expect_ms=False,
+            broker="Dhan",
+        )
 
         return Tick(
             symbol=symbol,
@@ -116,6 +178,7 @@ class TickNormalizer:
             vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else (raw.get("atp") if raw.get("atp") is not None else raw.get("vwap"))),
             oi=_safe_float(raw.get("OI") if raw.get("OI") is not None else raw.get("oi")),
             oi_change=_safe_float(raw.get("oi_change")),
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @staticmethod
@@ -135,7 +198,12 @@ class TickNormalizer:
         ask_price = float(asks[0].get("price", 0.0)) / _P if asks and isinstance(asks[0], dict) else 0.0
         ask_qty = float(asks[0].get("quantity", 0.0)) if asks and isinstance(asks[0], dict) else 0.0
 
-        ts = _parse_timestamp(raw.get("exchange_timestamp") or raw.get("timestamp"))
+        # AngelOne SmartWebSocket v2 sends exchange_timestamp as milliseconds epoch.
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("exchange_timestamp") or raw.get("timestamp"),
+            expect_ms=True,
+            broker="AngelOne",
+        )
         # AngelOne sends all prices in paise; _safe_float then divide by 100.
         _raw_ltp = raw.get("last_traded_price") if raw.get("last_traded_price") is not None else raw.get("ltp")
         ltp = _safe_float(_raw_ltp) / _P
@@ -160,6 +228,7 @@ class TickNormalizer:
             vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else raw.get("vwap")) / _P,
             oi=_safe_float(raw.get("open_interest") if raw.get("open_interest") is not None else raw.get("oi")),
             oi_change=_safe_float(raw.get("oi_change")),
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @staticmethod
@@ -168,7 +237,12 @@ class TickNormalizer:
         exchange = "BSE" if symbol.startswith("BSE:") else "NSE"
         inst_type = detect_instrument_type(symbol)
 
-        ts = _parse_timestamp(raw.get("exch_feed_time") or raw.get("timestamp"))
+        # Fyers sends exch_feed_time as seconds epoch (Unix timestamp).
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("exch_feed_time") or raw.get("timestamp"),
+            expect_ms=False,
+            broker="Fyers",
+        )
         oi = _safe_float(raw.get("oi"))
         pdoi = _safe_float(raw.get("pdoi"))
         _raw_oi_change = raw.get("oi_change")
@@ -216,6 +290,7 @@ class TickNormalizer:
             vwap=_safe_float(raw.get("atp") if raw.get("atp") is not None else raw.get("vwap")),
             oi=oi,
             oi_change=oi_change,
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @classmethod
