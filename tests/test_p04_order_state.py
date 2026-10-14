@@ -31,7 +31,7 @@ from adapters.order_manager import OrderManager
 from models.order import OrderUpdate
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────────────
 
 def _make_filled_order(cid: str = "CID_FILLED") -> Order:
     o = Order(
@@ -65,7 +65,7 @@ def _make_cancelled_order(cid: str = "CID_CANCELLED") -> Order:
     return o
 
 
-# ── 01–04: Terminal-state immutability via transition_to ──────────────────────
+# ── 01–04: Terminal-state immutability via transition_to ──────────────────────────
 
 class TestTerminalStateImmutabilityTransition(unittest.TestCase):
 
@@ -123,7 +123,7 @@ class TestTerminalStateImmutabilityTransition(unittest.TestCase):
         self.assertEqual(result.state, OrderState.EXPIRED)
 
 
-# ── 05: Non-terminal invalid transition still logs-and-proceeds ───────────────
+# ── 05: Non-terminal invalid transition still logs-and-proceeds ─────────────────
 
 class TestNonTerminalInvalidTransitionPreserved(unittest.TestCase):
 
@@ -155,7 +155,7 @@ class TestNonTerminalInvalidTransitionPreserved(unittest.TestCase):
                          "Non-terminal invalid transitions must still be applied")
 
 
-# ── 06–07: apply_fill on terminal-state orders ───────────────────────────────
+# ── 06–07: apply_fill on terminal-state orders ─────────────────────────────────
 
 class TestApplyFillOnTerminalOrder(unittest.TestCase):
 
@@ -319,7 +319,7 @@ class TestApplyFillOverfillProtection(unittest.TestCase):
         self.assertEqual(result.last_fill_qty, 0.0)
 
 
-# ── 13: TERMINAL_STATES exported correctly ───────────────────────────────────
+# ── 13: TERMINAL_STATES exported correctly ────────────────────────────────────────
 
 class TestTerminalStatesConstant(unittest.TestCase):
 
@@ -347,7 +347,7 @@ class TestTerminalStatesConstant(unittest.TestCase):
                              f"{state.value} must NOT be in TERMINAL_STATES")
 
 
-# ── 14–18: S05-CLOSEOUT fill-quantity consistency ────────────────────────────
+# ── 14–18: S05-CLOSEOUT fill-quantity consistency ──────────────────────────────
 
 class TestFillQuantityConsistency(unittest.TestCase):
     """
@@ -355,7 +355,7 @@ class TestFillQuantityConsistency(unittest.TestCase):
     quantity — flows consistently through handle_order_update into the audit
     record and the dispatched event.
 
-      14  Overfill via handle_order_update: dispatched event and audit carry accepted qty
+      14  Overfill: dispatched event and audit carry accepted qty + clamped flag
       15  Partial fill then exact completion: state and qty agree at each step
       16  Fill while CANCEL_PENDING goes through (not terminal)
       17  REJECTED order drops delayed fill; no dispatch
