@@ -5,6 +5,17 @@ import re
 from typing import Any, Dict, Optional
 from models.tick import Tick
 
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    """Convert value to float, returning fallback for None, NaN, and Inf."""
+    if value is None:
+        return fallback
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return result if math.isfinite(result) else fallback
+
 logger = logging.getLogger(__name__)
 
 OPTION_PATTERN = re.compile(r"(\d+(CE|PE)$|[\s_-](CE|PE)$)")
@@ -90,21 +101,21 @@ class TickNormalizer:
             exchange=exchange,
             instrument_type=inst_type,
             timestamp=ts,
-            ltp=float(raw.get("LTP") or raw.get("ltp") or 0.0),
+            ltp=_safe_float(raw.get("LTP") if raw.get("LTP") is not None else raw.get("ltp")),
             bid_price=bid_price,
             ask_price=ask_price,
             bid_qty=bid_qty,
             ask_qty=ask_qty,
-            volume=float(raw.get("volume") or raw.get("vol") or 0.0),
-            total_buy_qty=float(raw.get("total_buy_quantity") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("total_sell_quantity") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open") or 0.0),
-            high=float(raw.get("high") or 0.0),
-            low=float(raw.get("low") or 0.0),
-            close=float(raw.get("close") or raw.get("prev_close") or 0.0),
-            vwap=float(raw.get("avg_price") or raw.get("atp") or raw.get("vwap") or 0.0),
-            oi=float(raw.get("OI") or raw.get("oi") or 0.0),
-            oi_change=float(raw.get("oi_change") or 0.0),
+            volume=_safe_float(raw.get("volume") if raw.get("volume") is not None else raw.get("vol")),
+            total_buy_qty=_safe_float(raw.get("total_buy_quantity") if raw.get("total_buy_quantity") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("total_sell_quantity") if raw.get("total_sell_quantity") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open")),
+            high=_safe_float(raw.get("high")),
+            low=_safe_float(raw.get("low")),
+            close=_safe_float(raw.get("close") if raw.get("close") is not None else raw.get("prev_close")),
+            vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else (raw.get("atp") if raw.get("atp") is not None else raw.get("vwap"))),
+            oi=_safe_float(raw.get("OI") if raw.get("OI") is not None else raw.get("oi")),
+            oi_change=_safe_float(raw.get("oi_change")),
         )
 
     @staticmethod
@@ -125,7 +136,9 @@ class TickNormalizer:
         ask_qty = float(asks[0].get("quantity", 0.0)) if asks and isinstance(asks[0], dict) else 0.0
 
         ts = _parse_timestamp(raw.get("exchange_timestamp") or raw.get("timestamp"))
-        ltp = float(raw.get("last_traded_price") or raw.get("ltp") or 0.0) / _P
+        # AngelOne sends all prices in paise; _safe_float then divide by 100.
+        _raw_ltp = raw.get("last_traded_price") if raw.get("last_traded_price") is not None else raw.get("ltp")
+        ltp = _safe_float(_raw_ltp) / _P
 
         return Tick(
             symbol=symbol,
@@ -137,16 +150,16 @@ class TickNormalizer:
             ask_price=ask_price,
             bid_qty=bid_qty,
             ask_qty=ask_qty,
-            volume=float(raw.get("volume_trade_for_the_day") or raw.get("volume") or 0.0),
-            total_buy_qty=float(raw.get("total_buy_quantity") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("total_sell_quantity") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open_price_of_the_day") or raw.get("open") or 0.0) / _P,
-            high=float(raw.get("high_price_of_the_day") or raw.get("high") or 0.0) / _P,
-            low=float(raw.get("low_price_of_the_day") or raw.get("low") or 0.0) / _P,
-            close=float(raw.get("closed_price") or raw.get("close") or 0.0) / _P,
-            vwap=float(raw.get("avg_price") or raw.get("vwap") or 0.0) / _P,
-            oi=float(raw.get("open_interest") or raw.get("oi") or 0.0),
-            oi_change=float(raw.get("oi_change") or 0.0),
+            volume=_safe_float(raw.get("volume_trade_for_the_day") if raw.get("volume_trade_for_the_day") is not None else raw.get("volume")),
+            total_buy_qty=_safe_float(raw.get("total_buy_quantity") if raw.get("total_buy_quantity") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("total_sell_quantity") if raw.get("total_sell_quantity") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open_price_of_the_day") if raw.get("open_price_of_the_day") is not None else raw.get("open")) / _P,
+            high=_safe_float(raw.get("high_price_of_the_day") if raw.get("high_price_of_the_day") is not None else raw.get("high")) / _P,
+            low=_safe_float(raw.get("low_price_of_the_day") if raw.get("low_price_of_the_day") is not None else raw.get("low")) / _P,
+            close=_safe_float(raw.get("closed_price") if raw.get("closed_price") is not None else raw.get("close")) / _P,
+            vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else raw.get("vwap")) / _P,
+            oi=_safe_float(raw.get("open_interest") if raw.get("open_interest") is not None else raw.get("oi")),
+            oi_change=_safe_float(raw.get("oi_change")),
         )
 
     @staticmethod
@@ -156,9 +169,10 @@ class TickNormalizer:
         inst_type = detect_instrument_type(symbol)
 
         ts = _parse_timestamp(raw.get("exch_feed_time") or raw.get("timestamp"))
-        oi = float(raw.get("oi") or 0.0)
-        pdoi = float(raw.get("pdoi") or 0.0)
-        oi_change = float(raw.get("oi_change") or (oi - pdoi if pdoi > 0 else 0.0))
+        oi = _safe_float(raw.get("oi"))
+        pdoi = _safe_float(raw.get("pdoi"))
+        _raw_oi_change = raw.get("oi_change")
+        oi_change = _safe_float(_raw_oi_change) if _raw_oi_change is not None else (oi - pdoi if pdoi > 0 else 0.0)
 
         # Use None-aware key selection so an explicitly provided 0.0 is not silently
         # skipped in favour of an alternate key (the old `or` chain had this bug).
@@ -186,20 +200,20 @@ class TickNormalizer:
             exchange=exchange,
             instrument_type=inst_type,
             timestamp=ts,
-            ltp=float(raw.get("ltp") or 0.0),
+            ltp=_safe_float(raw.get("ltp")),
             bid_price=bid_price,
             ask_price=ask_price,
             bid_qty=bid_qty,
             ask_qty=ask_qty,
             bid_ask_valid=bid_ask_valid,
-            volume=float(raw.get("vol_traded_today") or raw.get("volume") or 0.0),
-            total_buy_qty=float(raw.get("tot_buy_gbd") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("tot_sell_gbd") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open_price") or raw.get("open") or 0.0),
-            high=float(raw.get("high_price") or raw.get("high") or 0.0),
-            low=float(raw.get("low_price") or raw.get("low") or 0.0),
-            close=float(raw.get("prev_close_price") or raw.get("close") or 0.0),
-            vwap=float(raw.get("atp") or raw.get("vwap") or 0.0),
+            volume=_safe_float(raw.get("vol_traded_today") if raw.get("vol_traded_today") is not None else raw.get("volume")),
+            total_buy_qty=_safe_float(raw.get("tot_buy_gbd") if raw.get("tot_buy_gbd") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("tot_sell_gbd") if raw.get("tot_sell_gbd") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open_price") if raw.get("open_price") is not None else raw.get("open")),
+            high=_safe_float(raw.get("high_price") if raw.get("high_price") is not None else raw.get("high")),
+            low=_safe_float(raw.get("low_price") if raw.get("low_price") is not None else raw.get("low")),
+            close=_safe_float(raw.get("prev_close_price") if raw.get("prev_close_price") is not None else raw.get("close")),
+            vwap=_safe_float(raw.get("atp") if raw.get("atp") is not None else raw.get("vwap")),
             oi=oi,
             oi_change=oi_change,
         )
