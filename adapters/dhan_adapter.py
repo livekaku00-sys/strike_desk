@@ -216,7 +216,12 @@ class DhanAdapter(BaseAdapter):
                 broker="dhan",
             )
         if isinstance(fund_limits, dict) and fund_limits.get("status", "").lower() == "failure":
-            raise AuthenticationError(f"Dhan auth failed: {fund_limits}", broker="dhan")
+            _status = fund_limits.get("status", "unknown")
+            _remarks = fund_limits.get("remarks", "") or fund_limits.get("message", "")
+            raise AuthenticationError(
+                f"Dhan auth failed: status={_status!r}" + (f" remarks={_remarks!r}" if _remarks else ""),
+                broker="dhan",
+            )
         self._client = client
         self._dhan_ctx = ctx  # saved for MarketFeed in _ws_connect
 

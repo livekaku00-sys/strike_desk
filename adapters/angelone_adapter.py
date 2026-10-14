@@ -325,12 +325,17 @@ class AngelOneAdapter(BaseAdapter):
                          data.get("message", "—") if isinstance(data, dict) else str(data)[:120])
 
             if not isinstance(data, dict) or not data.get("status"):
-                msg = data.get("message", "unknown") if isinstance(data, dict) else str(data)
-                logger.error("[AngelOne] TOTP auth FAILED — %s | full response: %s",
-                             msg, str(data)[:300])
+                msg = data.get("message", "unknown") if isinstance(data, dict) else type(data).__name__
+                logger.error("[AngelOne] TOTP auth FAILED — %s", msg)
                 raise AuthenticationError(f"AngelOne TOTP auth failed: {msg}", broker="angelone")
 
-            jwt_token = data["data"]["jwtToken"]
+            try:
+                jwt_token = data["data"]["jwtToken"]
+            except (KeyError, TypeError):
+                raise AuthenticationError(
+                    "AngelOne auth response: jwtToken not found in response data",
+                    broker="angelone",
+                )
             smart_api.setAccessToken(jwt_token)
             self._smart_api = smart_api
             self._access_token = jwt_token
