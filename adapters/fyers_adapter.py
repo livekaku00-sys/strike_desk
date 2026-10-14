@@ -596,124 +596,10 @@ class FyersAdapter(BaseAdapter):
     async def place_order(self, order: Order) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("fyers.place_order")
-        await rate_limiter.acquire("fyers")
-        # Without a session the request cannot reach the exchange. Returning an
-        # OrderUpdate here would report a phantom fill for an order that never left
-        # the process, so fail loudly instead.
-        if not self._fyers_model:
-            raise ConnectionError(
-                "Fyers adapter is not authenticated — order was not sent to the broker",
-                broker="fyers",
-            )
-
-        instrument = self.resolve_order_instrument(order)
-        logger.info(
-            "[Fyers] Routing %s %s x%s → symbol=%s",
-            order.side.value, order.symbol, order.quantity, instrument["symbol"],
-        )
-
-        # place_order must exist on the model. If it doesn't (SDK version mismatch
-        # or a stale mock), fail hard rather than silently returning a local UUID
-        # which would record a phantom OPEN order that never reached the exchange.
-        if not hasattr(self._fyers_model, "place_order"):
-            raise ConnectionError(
-                "Fyers model has no place_order method — SDK version mismatch or model not initialised",
-                broker="fyers",
-            )
-
-        loop = asyncio.get_running_loop()
-        side_num = 1 if order.side == OrderSide.BUY else -1
-        type_num = 1 if order.order_type == OrderType.LIMIT else 2
-        # Fyers expects total contracts (lots × lot_size) for FNO orders.
-        lot_size = 1
-        sym_upper = order.symbol.upper()
-        meta = order.metadata or {}
-        # Require a digit before CE/PE to avoid matching tickers like RELIANCE (ends in CE).
-        _is_opt_sym = bool(re.search(r"\d(?:CE|PE)$", sym_upper))
-        is_fno = (
-            meta.get("option_type")
-            or meta.get("underlying")
-            or _is_opt_sym
-            or "FUT" in sym_upper
-        )
-        if is_fno:
-            meta_underlying = meta.get("underlying", "")
-            if not meta_underlying:
-                from services.core_symbols import resolve_fut_underlying, resolve_opt_underlying
-                if "FUT" in sym_upper:
-                    meta_underlying = resolve_fut_underlying(sym_upper)
-                elif _is_opt_sym:
-                    meta_underlying = resolve_opt_underlying(sym_upper)
-            if meta_underlying:
-                underlying = meta_underlying.upper()
-                try:
-                    from services.instrument_registry import instrument_registry
-                    from models.instrument import Exchange as _Exchange
-                    from services.core_symbols import CORE_SYMBOLS, STOCK_FUTURES_LOT_SIZES
-                    inst = await instrument_registry.get(_Exchange.NSE, underlying + "-FUT")
-                    if inst is not None:
-                        lot_size = inst.lot_size
-                    elif underlying in CORE_SYMBOLS:
-                        lot_size = CORE_SYMBOLS[underlying]["lot_size"]
-                    elif underlying in STOCK_FUTURES_LOT_SIZES:
-                        lot_size = STOCK_FUTURES_LOT_SIZES[underlying]
-                except Exception:
-                    pass
-        logger.info("[Fyers] lot_size=%d for %s", lot_size, order.symbol)
-        data = {
-            "symbol": instrument["symbol"],
-            "qty": int(order.quantity) * lot_size,
-            "type": type_num,
-            "side": side_num,
-            "productType": "INTRADAY" if order.product_type == ProductType.INTRADAY else "CNC",
-            "limitPrice": order.price,
-            "stopPrice": order.trigger_price,
-            "validity": "DAY",
-            "disclosedQty": 0,
-            "offlineOrder": False,
-        }
-        res = await loop.run_in_executor(None, self._fyers_model.place_order, data)
-        logger.info("[Fyers] place_order raw response: %s", res)
-
-        res_d = res if isinstance(res, dict) else {}
-        if isinstance(res, dict) and res_d.get("s") != "ok":
-            raise RuntimeError(f"Fyers order failed: {res_d.get('message') or res_d.get('code')}")
-
-        broker_order_id = str(res_d.get("id") or "").strip()
-        if not broker_order_id:
-            raise RuntimeError(
-                f"Fyers place_order returned s='ok' but no id was found. "
-                f"The order state with the exchange is unknown — do NOT retry. "
-                f"Full response: {res_d}"
-            )
-
-        self.invalidate_balance_cache()
-        return OrderUpdate(
-            client_order_id=order.client_order_id,
-            broker_order_id=broker_order_id,
-            state=OrderState.OPEN,
-            remaining_qty=order.quantity,
-            filled_qty=0.0,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     async def cancel_order(self, client_order_id: str, broker_order_id: Optional[str] = None) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("fyers.cancel_order")
-        await rate_limiter.acquire("fyers")
-        if self._fyers_model and hasattr(self._fyers_model, "cancel_order") and broker_order_id:
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, self._fyers_model.cancel_order, {"id": broker_order_id})
-            if isinstance(res, dict) and res.get("s") != "ok":
-                raise RuntimeError(f"Fyers cancel failed: {res.get('message')}")
-
-        self.invalidate_balance_cache()
-        return OrderUpdate(
-            client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            state=OrderState.CANCELLED,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     async def modify_order(
         self,
@@ -724,26 +610,6 @@ class FyersAdapter(BaseAdapter):
     ) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("fyers.modify_order")
-        await rate_limiter.acquire("fyers")
-        if self._fyers_model and hasattr(self._fyers_model, "modify_order") and broker_order_id:
-            loop = asyncio.get_running_loop()
-            payload: Dict[str, Any] = {"id": broker_order_id}
-            if price is not None:
-                payload["limitPrice"] = price
-            if quantity is not None:
-                payload["qty"] = int(quantity)
-            res = await loop.run_in_executor(None, self._fyers_model.modify_order, payload)
-            if isinstance(res, dict) and res.get("s") != "ok":
-                raise RuntimeError(f"Fyers modify failed: {res.get('message')}")
-
-        return OrderUpdate(
-            client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            state=OrderState.OPEN,
-            remaining_qty=quantity or 0.0,
-            avg_fill_price=price or 0.0,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     def _map_fyers_status(self, raw_status: Any) -> OrderState:
         s = str(raw_status).strip().lower()

@@ -371,7 +371,16 @@ async def confirm_flatten_all(
         "event_id": event.event_id,
         "timestamp": datetime.now(IST).isoformat(),
     })
-    execution = await _execute_flatten_positions(adapters, event.event_id)
+    try:
+        execution = await _execute_flatten_positions(adapters, event.event_id)
+    except Exception as _exc:
+        from utils.live_order_guard import LiveOrderProhibitedError
+        if isinstance(_exc, LiveOrderProhibitedError):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Live order dispatch is permanently prohibited in this build.",
+            )
+        raise
     return {
         "success": True,
         "message": "FLATTEN ALL executed — halt engaged, positions closed.",

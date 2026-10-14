@@ -677,141 +677,10 @@ class AngelOneAdapter(BaseAdapter):
     async def place_order(self, order: Order) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("angelone.place_order")
-        await rate_limiter.acquire("angelone")
-        # Without a session the request cannot reach the exchange. Returning an OPEN
-        # update here would report a phantom fill for an order that never left the
-        # process, so fail loudly instead.
-        if not self._smart_api:
-            raise ConnectionError(
-                "AngelOne adapter is not authenticated — order was not sent to the broker",
-                broker="angelone",
-            )
-        # placeOrder must exist on the session object. If it doesn't (SDK version
-        # mismatch or a stale mock), fail hard rather than silently using a local UUID
-        # which would record a phantom OPEN order that never reached the exchange.
-        if not hasattr(self._smart_api, "placeOrder"):
-            raise ConnectionError(
-                "AngelOne SmartConnect session has no placeOrder method — "
-                "SDK version mismatch or session was not fully initialised",
-                broker="angelone",
-            )
-
-        instrument = self.resolve_order_instrument(order)
-        logger.info(
-            "[AngelOne] Routing %s %s x%s → symboltoken=%s tradingsymbol=%s exchange=%s",
-            order.side.value, order.symbol, order.quantity,
-            instrument["symboltoken"], instrument["tradingsymbol"], instrument["exchange"],
-        )
-
-        loop = asyncio.get_running_loop()
-        exch = instrument["exchange"]
-
-        # producttype: positional F&O uses CARRYFORWARD on AngelOne — DELIVERY is
-        # only valid for CNC cash equities and is rejected outright on NFO/BFO.
-        if order.product_type == ProductType.INTRADAY:
-            product_type_str = "INTRADAY"
-        elif order.product_type == ProductType.CARRYFORWARD or exch in ("NFO", "BFO"):
-            product_type_str = "CARRYFORWARD"
-        else:
-            product_type_str = "DELIVERY"
-
-        # quantity: the Order carries lots; the exchange requires total shares.
-        lot_size = 1
-        if exch in ("NFO", "BFO"):
-            tsym = instrument["tradingsymbol"]
-            opt_entry = self._fno_by_symbol.get(tsym)
-            fut_entry = self._futures_by_symbol.get(tsym)
-            if opt_entry:
-                lot_size = max(1, int(opt_entry.get("lotsize") or 1))
-            elif fut_entry:
-                lot_size = max(1, int(fut_entry.get("lotsize") or 1))
-
-        order_params = {
-            "variety": "NORMAL",
-            "tradingsymbol": instrument["tradingsymbol"],
-            "symboltoken": instrument["symboltoken"],
-            "transactiontype": "BUY" if order.side == OrderSide.BUY else "SELL",
-            "exchange": exch,
-            "ordertype": "LIMIT" if order.order_type == OrderType.LIMIT else "MARKET",
-            "producttype": product_type_str,
-            "duration": "DAY",
-            "price": str(order.price),
-            "quantity": str(int(order.quantity) * lot_size),
-        }
-        logger.info("[AngelOne] Placing order — payload: %s", order_params)
-        res = await loop.run_in_executor(None, self._smart_api.placeOrder, order_params)
-
-        # Always log the raw response so post-mortems are possible.
-        logger.info("[AngelOne] placeOrder raw response: %s", res)
-
-        if res is None:
-            raise RuntimeError(
-                "AngelOne placeOrder returned None — possible session expiry or network failure"
-            )
-
-        res_d = res if isinstance(res, dict) else {}
-
-        # AngelOne uses "status" in some API versions and "success" in others.
-        # Treat the response as OK only when one of them is explicitly True (bool).
-        # A missing key is also a failure — never treat absence as success.
-        status_ok = (res_d.get("status") is True) or (res_d.get("success") is True)
-        errorcode = str(res_d.get("errorcode") or res_d.get("errorCode") or "").strip()
-        message = str(res_d.get("message") or "").strip()
-
-        if not status_ok or errorcode:
-            raise RuntimeError(
-                f"AngelOne order error: message='{message}' errorcode='{errorcode}' "
-                f"| full response: {res_d}"
-            )
-
-        # Extract the broker order ID. AngelOne's SmartAPI returns it as "orderid"
-        # inside the "data" dict, but some library versions use "uniqueorderid" at
-        # the top level — check both locations.
-        # "data" can be an empty string "" on some error paths, so guard the isinstance.
-        raw_data = res_d.get("data")
-        data = raw_data if isinstance(raw_data, dict) else {}
-        broker_order_id = (
-            data.get("orderid")
-            or data.get("uniqueorderid")
-            or res_d.get("orderid")
-            or res_d.get("uniqueorderid")
-        )
-
-        if not broker_order_id:
-            raise RuntimeError(
-                f"AngelOne placeOrder returned status=True but no orderid was found. "
-                f"The order state with the exchange is unknown — do NOT retry. "
-                f"Full response: {res_d}"
-            )
-
-        self.invalidate_balance_cache()
-        return OrderUpdate(
-            client_order_id=order.client_order_id,
-            broker_order_id=str(broker_order_id),
-            state=OrderState.OPEN,
-            remaining_qty=order.quantity,
-            filled_qty=0.0,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     async def cancel_order(self, client_order_id: str, broker_order_id: Optional[str] = None) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("angelone.cancel_order")
-        await rate_limiter.acquire("angelone")
-        if self._smart_api and hasattr(self._smart_api, "cancelOrder") and broker_order_id:
-            loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, self._smart_api.cancelOrder, broker_order_id, "NORMAL")
-            res_d = res if isinstance(res, dict) else {}
-            if res_d.get("status") is False or res_d.get("success") is False:
-                raise RuntimeError(f"AngelOne cancel failed: {res_d.get('message')}")
-
-        self.invalidate_balance_cache()
-        return OrderUpdate(
-            client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            state=OrderState.CANCELLED,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     async def modify_order(
         self,
@@ -822,30 +691,6 @@ class AngelOneAdapter(BaseAdapter):
     ) -> OrderUpdate:
         from utils.live_order_guard import prohibit_live_order
         prohibit_live_order("angelone.modify_order")
-        await rate_limiter.acquire("angelone")
-        if self._smart_api and hasattr(self._smart_api, "modifyOrder") and broker_order_id:
-            loop = asyncio.get_running_loop()
-            params = {
-                "orderid": broker_order_id,
-                "variety": "NORMAL",
-            }
-            if price is not None:
-                params["price"] = str(price)
-            if quantity is not None:
-                params["quantity"] = str(int(quantity))
-            res = await loop.run_in_executor(None, self._smart_api.modifyOrder, params)
-            res_d = res if isinstance(res, dict) else {}
-            if res_d.get("status") is False or res_d.get("success") is False:
-                raise RuntimeError(f"AngelOne modify failed: {res_d.get('message')}")
-
-        return OrderUpdate(
-            client_order_id=client_order_id,
-            broker_order_id=broker_order_id,
-            state=OrderState.OPEN,
-            remaining_qty=quantity or 0.0,
-            avg_fill_price=price or 0.0,
-            timestamp=datetime.now(timezone.utc),
-        )
 
     def _map_angel_status(self, raw_status: str) -> OrderState:
         s = raw_status.strip().lower()
