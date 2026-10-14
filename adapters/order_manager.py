@@ -183,6 +183,7 @@ class OrderManager:
             old_state=OrderState.PENDING.value,
             new_state=OrderState.SUBMITTED.value,
             reason="order dispatched to broker",
+            signal_id=str((order.metadata or {}).get("signal_id", "")),
         )
 
         try:
@@ -216,6 +217,7 @@ class OrderManager:
                 new_state=OrderState.UNKNOWN.value,
                 reason="timeout after submission; querying broker to resolve",
                 order_id=order.broker_order_id or "",
+                signal_id=str((order.metadata or {}).get("signal_id", "")),
             )
 
             # Query broker to resolve — must not resubmit
@@ -259,6 +261,7 @@ class OrderManager:
                 old_state=prev_state.value,
                 new_state=OrderState.REJECTED.value,
                 reason=(raw_msg or "")[:200],
+                signal_id=str((order.metadata or {}).get("signal_id", "")),
             )
             return rej_update
 

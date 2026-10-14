@@ -49,6 +49,16 @@ class BaseIndicatorCalculator(ABC):
                 self.symbol,
                 tick.ltp,
             )
+            try:
+                from execution.audit_logger import audit_logger as _audit_logger
+                _audit_logger.log_market_data_event(
+                    symbol=self.symbol,
+                    event_subtype="INVALID_LTP",
+                    reason=f"ltp_valid=False; ltp={tick.ltp!r}",
+                    ltp=tick.ltp,
+                )
+            except Exception:
+                pass
             return dict(self.indicator_values)
 
         # 1. Out-of-order detection

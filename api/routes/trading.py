@@ -806,6 +806,16 @@ async def place_order(
             "filled_at": None,
         }
         _save_orders_db()
+        try:
+            from execution.audit_logger import audit_logger as _al
+            _al.log_risk_rejection(
+                symbol=order.symbol,
+                broker=active_broker,
+                rule_violated=auth.rule_violated or "ORDER_AUTHORIZER",
+                reason=auth.reason or "",
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
 
     # Execution routing. In PAPER the order goes to the virtual ledger and no
@@ -867,6 +877,18 @@ async def place_order(
             "filled_at": None,
         }
         _save_orders_db()
+        try:
+            from execution.audit_logger import audit_logger as _al
+            _al.log_order_transition(
+                client_order_id=order.client_order_id,
+                symbol=order.symbol,
+                broker=active_broker,
+                old_state="SUBMITTED",
+                new_state="REJECTED",
+                reason=str(exc)[:200],
+            )
+        except Exception:
+            pass
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Broker '{active_broker}' rejected the order: {exc}",

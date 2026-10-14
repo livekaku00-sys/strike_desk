@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 PAPER_BROKER_NAME = "paper"
 
 
+def _get_audit_logger():
+    from execution.audit_logger import audit_logger
+    return audit_logger
+
+
 @dataclass
 class PaperPosition:
     symbol: str
@@ -312,6 +317,32 @@ class PaperBrokerAdapter:
             order.side.value, order.symbol, qty, fill_price,
             self.cash, self.positions.get(order.symbol.upper(), PaperPosition(order.symbol)).quantity,
         )
+
+        _signal_id = str((order.metadata or {}).get("signal_id", ""))
+        try:
+            _get_audit_logger().log_order_transition(
+                client_order_id=order.client_order_id,
+                symbol=order.symbol,
+                broker=PAPER_BROKER_NAME,
+                old_state=OrderState.PENDING.value,
+                new_state=OrderState.SUBMITTED.value,
+                reason="paper order routed to virtual ledger; no broker API called",
+                signal_id=_signal_id,
+            )
+            _get_audit_logger().log_order_transition(
+                client_order_id=order.client_order_id,
+                symbol=order.symbol,
+                broker=PAPER_BROKER_NAME,
+                old_state=OrderState.SUBMITTED.value,
+                new_state=OrderState.FILLED.value,
+                reason="simulated fill; no broker order API called",
+                fill_price=fill_price,
+                fill_qty=qty,
+                order_id=broker_order_id,
+                signal_id=_signal_id,
+            )
+        except Exception as _audit_exc:
+            logger.warning("[PAPER] Audit log failed: %s", _audit_exc)
 
         return OrderUpdate(
             client_order_id=order.client_order_id,
