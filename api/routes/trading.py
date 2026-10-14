@@ -230,6 +230,7 @@ def record_fill_in_risk(order, update, order_id: str, fill_price: float, categor
         from risk.circuit_breaker import circuit_breaker as _cb
         from models.risk_state import Trade as _RiskTrade
         from models.order import OrderSide as _Side
+        from risk.charge_calculator import ChargeCalculator as _CC
 
         meta = getattr(update, "metadata", None) or {}
         lot_size = int(meta.get("lot_size") or 1)
@@ -241,6 +242,20 @@ def record_fill_in_risk(order, update, order_id: str, fill_price: float, categor
         if meta.get("realized_pnl") is not None:
             realized = float(meta["realized_pnl"])
         segment = "FNO" if category in _FNO_CATEGORIES else "EQUITY"
+        trade_type = "FNO" if segment == "FNO" else "INTRADAY"
+        # Charges are computed only for exit fills (realized != 0).  Entry fills
+        # carry realized=0, charges=0, net_pnl=0 — the neutral sentinel used by
+        # RiskStateManager.record_trade() to skip consecutive-loss tracking for
+        # positions that are not yet closed.
+        charges = 0.0
+        if realized != 0.0:
+            turnover = float(units) * fill_price
+            charges = _CC.calculate_total_charges(
+                turnover=turnover,
+                trade_type=trade_type,
+                segment=segment,
+                is_sell=(order.side == _Side.SELL),
+            )
         _cb.on_trade_completed(_RiskTrade(
             trade_id=order_id,
             symbol=order.symbol,
@@ -248,8 +263,10 @@ def record_fill_in_risk(order, update, order_id: str, fill_price: float, categor
             quantity=float(units),
             entry_price=fill_price,
             realized_pnl=realized,
-            net_pnl=realized,
-            trade_type="FNO" if segment == "FNO" else "INTRADAY",
+            charges=charges,
+            # net_pnl: Trade.__post_init__ auto-computes realized - charges when
+            # net_pnl is left at its 0.0 default, giving true economic loss.
+            trade_type=trade_type,
             segment=segment,
         ))
         summary = _rm.get_risk_summary()
