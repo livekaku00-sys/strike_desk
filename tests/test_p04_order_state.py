@@ -18,6 +18,7 @@ Coverage matrix (13 tests across 5 categories):
 """
 
 import unittest
+from unittest.mock import patch
 
 from models.order import (
     Order,
@@ -30,7 +31,7 @@ from adapters.order_manager import OrderManager
 from models.order import OrderUpdate
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────────────
 
 def _make_filled_order(cid: str = "CID_FILLED") -> Order:
     o = Order(
@@ -64,7 +65,7 @@ def _make_cancelled_order(cid: str = "CID_CANCELLED") -> Order:
     return o
 
 
-# ── 01–04: Terminal-state immutability via transition_to ──────────────────────
+# ── 01–04: Terminal-state immutability via transition_to ──────────────────────────
 
 class TestTerminalStateImmutabilityTransition(unittest.TestCase):
 
@@ -122,7 +123,7 @@ class TestTerminalStateImmutabilityTransition(unittest.TestCase):
         self.assertEqual(result.state, OrderState.EXPIRED)
 
 
-# ── 05: Non-terminal invalid transition still logs-and-proceeds ───────────────
+# ── 05: Non-terminal invalid transition still logs-and-proceeds ─────────────────
 
 class TestNonTerminalInvalidTransitionPreserved(unittest.TestCase):
 
@@ -154,7 +155,7 @@ class TestNonTerminalInvalidTransitionPreserved(unittest.TestCase):
                          "Non-terminal invalid transitions must still be applied")
 
 
-# ── 06–07: apply_fill on terminal-state orders ───────────────────────────────
+# ── 06–07: apply_fill on terminal-state orders ─────────────────────────────────
 
 class TestApplyFillOnTerminalOrder(unittest.TestCase):
 
@@ -318,7 +319,7 @@ class TestApplyFillOverfillProtection(unittest.TestCase):
         self.assertEqual(result.last_fill_qty, 0.0)
 
 
-# ── 13: TERMINAL_STATES exported correctly ───────────────────────────────────
+# ── 13: TERMINAL_STATES exported correctly ────────────────────────────────────────
 
 class TestTerminalStatesConstant(unittest.TestCase):
 
@@ -344,6 +345,201 @@ class TestTerminalStatesConstant(unittest.TestCase):
         ):
             self.assertNotIn(state, TERMINAL_STATES,
                              f"{state.value} must NOT be in TERMINAL_STATES")
+
+
+# ── 14–18: S05-CLOSEOUT fill-quantity consistency ──────────────────────────────
+
+class TestFillQuantityConsistency(unittest.TestCase):
+    """
+    Verify that the accepted (clamped) fill quantity — not the broker-reported
+    quantity — flows consistently through handle_order_update into the audit
+    record and the dispatched event.
+
+      14  Overfill: dispatched event and audit carry accepted qty + clamped flag
+      15  Partial fill then exact completion: state and qty agree at each step
+      16  Fill while CANCEL_PENDING goes through (not terminal)
+      17  REJECTED order drops delayed fill; no dispatch
+      18  EXPIRED order drops delayed fill (delta path); no dispatch
+    """
+
+    def setUp(self):
+        self.mgr = OrderManager()
+        self.dispatched = []
+        self.mgr.register_update_listener(self.dispatched.append)
+
+    def _register(self, order: Order) -> None:
+        self.mgr._orders[order.client_order_id] = order
+
+    def _open_order(self, cid: str, qty: float = 100.0, price: float = 400.0) -> Order:
+        o = Order(
+            client_order_id=cid,
+            symbol="NIFTY",
+            exchange="NSE",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=qty,
+            price=price,
+        )
+        o.transition_to(OrderState.OPEN)
+        return o
+
+    def test_14_overfill_dispatched_event_and_audit_carry_accepted_qty(self):
+        """
+        Broker reports last_fill_qty=80 but only 40 remain.  The dispatched
+        event, the return value, and the audit fill_qty must all equal 40
+        (accepted).  The audit reason must mention 'clamped'.
+        """
+        order = self._open_order("CID_T14")
+        order.apply_fill(fill_qty=60.0, fill_price=400.0)   # 60 filled, 40 remaining
+        self._register(order)
+
+        audit_calls = []
+        with patch("adapters.order_manager._get_audit_logger") as mock_al:
+            mock_al.return_value.log_order_transition = \
+                lambda **kw: audit_calls.append(kw)
+            result = self.mgr.handle_order_update(OrderUpdate(
+                client_order_id="CID_T14",
+                state=OrderState.FILLED,
+                last_fill_qty=80.0,
+                last_fill_price=402.0,
+            ))
+
+        self.assertEqual(order.state, OrderState.FILLED)
+        self.assertEqual(order.filled_qty, 100.0)
+        self.assertEqual(order.remaining_qty, 0.0)
+
+        # Dispatched event carries accepted qty (clamped 40, not reported 80)
+        self.assertEqual(len(self.dispatched), 1)
+        self.assertAlmostEqual(self.dispatched[0].last_fill_qty, 40.0, places=4)
+
+        # Return value carries accepted qty
+        self.assertAlmostEqual(result.last_fill_qty, 40.0, places=4)
+
+        # Audit records accepted qty and flags the discrepancy
+        self.assertEqual(len(audit_calls), 1)
+        self.assertAlmostEqual(audit_calls[0]["fill_qty"], 40.0, places=4)
+        self.assertIn("clamped", audit_calls[0]["reason"])
+
+    def test_15_partial_fill_then_exact_completion(self):
+        """
+        Two sequential fills summing to exactly quantity: accepted qty, state,
+        and avg_fill_price agree at each step.
+        """
+        order = self._open_order("CID_T15", qty=100.0, price=500.0)
+        self._register(order)
+
+        with patch("adapters.order_manager._get_audit_logger"):
+            r1 = self.mgr.handle_order_update(OrderUpdate(
+                client_order_id="CID_T15",
+                state=OrderState.PARTIALLY_FILLED,
+                last_fill_qty=60.0,
+                last_fill_price=500.0,
+            ))
+
+        self.assertEqual(order.state, OrderState.PARTIALLY_FILLED)
+        self.assertAlmostEqual(r1.last_fill_qty, 60.0, places=4)
+        self.assertAlmostEqual(r1.filled_qty, 60.0, places=4)
+        self.assertAlmostEqual(r1.remaining_qty, 40.0, places=4)
+
+        with patch("adapters.order_manager._get_audit_logger"):
+            r2 = self.mgr.handle_order_update(OrderUpdate(
+                client_order_id="CID_T15",
+                state=OrderState.FILLED,
+                last_fill_qty=40.0,
+                last_fill_price=502.0,
+            ))
+
+        self.assertEqual(order.state, OrderState.FILLED)
+        self.assertEqual(order.filled_qty, 100.0)
+        self.assertEqual(order.remaining_qty, 0.0)
+        self.assertAlmostEqual(r2.last_fill_qty, 40.0, places=4)
+        # avg = (60*500 + 40*502) / 100 = 500.80
+        self.assertAlmostEqual(order.avg_fill_price, 500.80, places=4)
+
+    def test_16_fill_while_cancel_pending_goes_through(self):
+        """
+        CANCEL_PENDING is not terminal: a fill update must be accepted,
+        not dropped.  The order must transition and the fill must be dispatched.
+        """
+        order = Order(
+            client_order_id="CID_T16",
+            symbol="BANKNIFTY",
+            exchange="NSE",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=50.0,
+            price=45000.0,
+        )
+        order.transition_to(OrderState.OPEN)
+        order.transition_to(OrderState.CANCEL_PENDING)
+        self._register(order)
+
+        with patch("adapters.order_manager._get_audit_logger"):
+            result = self.mgr.handle_order_update(OrderUpdate(
+                client_order_id="CID_T16",
+                state=OrderState.PARTIALLY_FILLED,
+                last_fill_qty=20.0,
+                last_fill_price=45100.0,
+            ))
+
+        self.assertEqual(order.state, OrderState.PARTIALLY_FILLED,
+                         "CANCEL_PENDING is not terminal; fill must be accepted")
+        self.assertAlmostEqual(order.filled_qty, 20.0, places=4)
+        self.assertAlmostEqual(result.last_fill_qty, 20.0, places=4)
+        self.assertEqual(len(self.dispatched), 1)
+        self.assertAlmostEqual(self.dispatched[0].last_fill_qty, 20.0, places=4)
+
+    def test_17_rejected_order_drops_delayed_fill_no_dispatch(self):
+        """REJECTED is terminal: delayed fill must be dropped; no dispatch."""
+        order = Order(
+            client_order_id="CID_T17",
+            symbol="WIPRO",
+            exchange="NSE",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=10.0,
+            price=400.0,
+        )
+        order.transition_to(OrderState.REJECTED)
+        self._register(order)
+
+        self.mgr.handle_order_update(OrderUpdate(
+            client_order_id="CID_T17",
+            state=OrderState.PARTIALLY_FILLED,
+            last_fill_qty=5.0,
+            last_fill_price=401.0,
+        ))
+
+        self.assertEqual(order.state, OrderState.REJECTED)
+        self.assertEqual(order.filled_qty, 0.0)
+        self.assertEqual(len(self.dispatched), 0,
+                         "No event must be dispatched for a terminal-state guard rejection")
+
+    def test_18_expired_order_drops_delayed_fill_delta_path_no_dispatch(self):
+        """EXPIRED is terminal: delayed fill via the delta path must be dropped; no dispatch."""
+        order = Order(
+            client_order_id="CID_T18",
+            symbol="TCS",
+            exchange="NSE",
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=20.0,
+            price=3900.0,
+        )
+        order.transition_to(OrderState.OPEN)
+        order.transition_to(OrderState.EXPIRED)
+        self._register(order)
+
+        self.mgr.handle_order_update(OrderUpdate(
+            client_order_id="CID_T18",
+            state=OrderState.PARTIALLY_FILLED,
+            filled_qty=order.filled_qty + 10.0,   # delta path
+            avg_fill_price=3901.0,
+        ))
+
+        self.assertEqual(order.state, OrderState.EXPIRED)
+        self.assertEqual(order.filled_qty, 0.0)
+        self.assertEqual(len(self.dispatched), 0)
 
 
 if __name__ == "__main__":
