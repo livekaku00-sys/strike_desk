@@ -12,6 +12,7 @@ from models.order import (
     OrderType,
     OrderUpdate,
     ProductType,
+    TERMINAL_STATES,
 )
 from utils.order_id_generator import (
     compute_order_signature,
@@ -326,6 +327,23 @@ class OrderManager:
             self._broker_to_client_id[update.broker_order_id] = order.client_order_id
 
         old_state = order.state
+
+        # Drop fill updates for orders already in a terminal state.  A delayed
+        # or duplicate fill from the broker must never reopen or overfill an
+        # order that has already settled.
+        if old_state in TERMINAL_STATES and (
+            (update.last_fill_qty > 0 and update.last_fill_price > 0)
+            or update.filled_qty > order.filled_qty
+        ):
+            logger.warning(
+                "[%s] Dropping fill update (last_fill_qty=%s, filled_qty=%s) "
+                "for order already in terminal state %s.",
+                order.client_order_id,
+                update.last_fill_qty,
+                update.filled_qty,
+                old_state.value,
+            )
+            return update
 
         if update.last_fill_qty > 0 and update.last_fill_price > 0:
             order.apply_fill(

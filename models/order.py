@@ -115,6 +115,14 @@ VALID_TRANSITIONS: Dict[OrderState, List[OrderState]] = {
     OrderState.EXPIRED: [],
 }
 
+# States from which no further transition is permitted.
+TERMINAL_STATES: frozenset = frozenset({
+    OrderState.FILLED,
+    OrderState.REJECTED,
+    OrderState.CANCELLED,
+    OrderState.EXPIRED,
+})
+
 
 @dataclass
 class OrderUpdate:
@@ -206,6 +214,20 @@ class Order:
             ts = ts.replace(tzinfo=timezone.utc)
 
         if not self.can_transition_to(new_state):
+            if self.state in TERMINAL_STATES:
+                logger.warning(
+                    "[%s] Ignoring transition from terminal state %s → %s.",
+                    self.client_order_id, self.state.value, new_state.value,
+                )
+                return OrderUpdate(
+                    client_order_id=self.client_order_id,
+                    broker_order_id=self.broker_order_id,
+                    state=self.state,
+                    filled_qty=self.filled_qty,
+                    remaining_qty=self.remaining_qty,
+                    avg_fill_price=self.avg_fill_price,
+                    timestamp=ts,
+                )
             logger.warning(
                 "[%s] Invalid state transition: %s -> %s. Recording update to prevent desync.",
                 self.client_order_id,
@@ -255,12 +277,51 @@ class Order:
         broker_order_id: Optional[str] = None,
     ) -> OrderUpdate:
         ts = timestamp or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
         if fill_qty <= 0:
             raise ValueError(f"Fill quantity must be positive, got {fill_qty}")
 
+        if self.state in TERMINAL_STATES:
+            logger.warning(
+                "[%s] Ignoring fill (qty=%s @ %s) on order already in terminal state %s.",
+                self.client_order_id, fill_qty, fill_price, self.state.value,
+            )
+            return OrderUpdate(
+                client_order_id=self.client_order_id,
+                broker_order_id=self.broker_order_id or broker_order_id,
+                state=self.state,
+                filled_qty=self.filled_qty,
+                remaining_qty=self.remaining_qty,
+                avg_fill_price=self.avg_fill_price,
+                last_fill_qty=0.0,
+                last_fill_price=0.0,
+                timestamp=ts,
+            )
+
+        new_filled_qty = self.filled_qty + fill_qty
+        if new_filled_qty > self.quantity:
+            logger.warning(
+                "[%s] Overfill: cumulative fill %.4g would exceed order qty %.4g. Clamping.",
+                self.client_order_id, new_filled_qty, self.quantity,
+            )
+            fill_qty = max(0.0, self.quantity - self.filled_qty)
+            if fill_qty == 0.0:
+                return OrderUpdate(
+                    client_order_id=self.client_order_id,
+                    broker_order_id=self.broker_order_id or broker_order_id,
+                    state=self.state,
+                    filled_qty=self.filled_qty,
+                    remaining_qty=self.remaining_qty,
+                    avg_fill_price=self.avg_fill_price,
+                    last_fill_qty=0.0,
+                    last_fill_price=0.0,
+                    timestamp=ts,
+                )
+            new_filled_qty = self.quantity
+
         total_prev_val = self.filled_qty * self.avg_fill_price
         new_fill_val = fill_qty * fill_price
-        new_filled_qty = self.filled_qty + fill_qty
 
         self.filled_qty = new_filled_qty
         self.avg_fill_price = round((total_prev_val + new_fill_val) / new_filled_qty, 4)
