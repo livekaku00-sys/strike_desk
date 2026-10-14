@@ -39,6 +39,50 @@ def _mode_lock_path() -> str:
     )
 
 
+def _paper_broker_db_path() -> str:
+    return os.environ.get("STRIKE_DESK_PAPER_LEDGER_FILE") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data", "paper_ledger.json",
+    )
+
+
+def _orders_db_path() -> str:
+    return os.environ.get("STRIKE_DESK_ORDERS_FILE") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data", "orders_db.json",
+    )
+
+
+def _save_orders_db() -> None:
+    path = _orders_db_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(_orders_db.values()), f, indent=2)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.critical("[Orders] Failed to persist orders_db to %s: %s", path, exc)
+
+
+def _load_orders_db() -> None:
+    path = _orders_db_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list):
+            return
+        for rec in records:
+            oid = rec.get("order_id")
+            if oid:
+                _orders_db[oid] = rec
+        logger.info("[Orders] Restored %d order records from %s", len(_orders_db), path)
+    except Exception as exc:
+        logger.warning("[Orders] Cannot load orders_db from %s: %s", path, exc)
+
+
 class ModeController:
     """Operator's execution class lock. Persisted so a restart keeps it.
     PAPER/LIVE is deliberately NOT persisted — it always restarts as PAPER."""
@@ -161,6 +205,7 @@ def get_paper_broker():
             # option chain so held contracts show live P&L instead of entry price.
             ltp_provider=mark_price,
             tick_provider=pipeline_orchestrator.get_latest_tick,
+            db_path=_paper_broker_db_path(),
         )
     return _paper_broker
 
@@ -527,6 +572,7 @@ def resolve_order_category(order_req: OrderRequest) -> str:
 
 _orders_db: Dict[str, Dict[str, Any]] = {}
 _positions_db: Dict[str, Dict[str, Any]] = {}
+_load_orders_db()
 
 
 def _restore_contract_identity(order, exec_mode: "ExecutionModeController") -> None:
@@ -742,6 +788,7 @@ async def place_order(
             "placed_at": datetime.now(IST).isoformat(),
             "filled_at": None,
         }
+        _save_orders_db()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
 
     # Execution routing. In PAPER the order goes to the virtual ledger and no
@@ -802,6 +849,7 @@ async def place_order(
             "placed_at": datetime.now(IST).isoformat(),
             "filled_at": None,
         }
+        _save_orders_db()
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Broker '{active_broker}' rejected the order: {exc}",
@@ -845,6 +893,7 @@ async def place_order(
         "filled_at": datetime.now(IST).isoformat() if (is_paper and filled) else None,
     }
     _orders_db[oid] = order_data
+    _save_orders_db()
     logger.info("[Orders] %s %s x%s placed on %s → %s (id=%s)",
                 order_req.side, order_req.symbol, order_req.quantity,
                 active_broker, order_data["status"], oid)
@@ -882,6 +931,7 @@ async def force_reject_order(order_id: str, reason: str = "operator-forced-rejec
         )
     entry["status"] = "REJECTED"
     entry["reject_reason"] = reason
+    _save_orders_db()
     logger.warning(
         "[Orders] force-reject applied to %s (was %s): %s",
         order_id, current, reason,
@@ -998,6 +1048,7 @@ async def square_off_position(
         "category": category, "is_manual": True,
         "placed_at": datetime.now(IST).isoformat(), "filled_at": datetime.now(IST).isoformat(),
     }
+    _save_orders_db()
     realized = float((update.metadata or {}).get("realized_pnl") or 0.0)
     logger.critical(
         "[SQUARE-OFF] %s %s lots x %s = %s units: entry %.2f -> exit %.2f | realized %.2f",

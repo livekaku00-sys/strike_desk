@@ -18,6 +18,8 @@ _REDIRECTS = {
     "STRIKE_DESK_RISK_BACKUP": "risk_state_backup.json",     # risk/risk_state_manager.py
     "STRIKE_DESK_HALT_FILE": "halt_state.json",              # risk/emergency_halt.py
     "AUDIT_DB_PATH": "audit.db",                             # execution/audit_logger.py
+    "STRIKE_DESK_PAPER_LEDGER_FILE": "paper_ledger.json",    # adapters/paper_broker.py (P0-1)
+    "STRIKE_DESK_ORDERS_FILE": "orders_db.json",             # api/routes/trading.py (P0-1)
 }
 for _var, _name in _REDIRECTS.items():
     os.environ[_var] = os.path.join(_scratch, _name)

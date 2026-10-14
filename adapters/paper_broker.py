@@ -12,7 +12,9 @@ feed, the order is rejected rather than filled at a guessed price.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -67,7 +69,7 @@ class PaperBrokerAdapter:
     execution path calls on an adapter.
     """
 
-    def __init__(self, ltp_provider, starting_cash: float = 1_000_000.0, tick_provider=None) -> None:
+    def __init__(self, ltp_provider, starting_cash: float = 1_000_000.0, tick_provider=None, db_path: Optional[str] = None) -> None:
         # `ltp_provider(symbol) -> Optional[float]` reads the live tick store.
         # `tick_provider(symbol) -> Optional[Tick]` used when source validation is required (P0-09).
         self._ltp_provider = ltp_provider
@@ -77,6 +79,73 @@ class PaperBrokerAdapter:
         self.cash = starting_cash
         self.positions: Dict[str, PaperPosition] = {}
         self.fills: List[Dict[str, Any]] = []
+        self._db_path = db_path
+        if self._db_path:
+            self._load_ledger()
+
+    # ----- disk persistence ----------------------------------------------
+
+    def _save_ledger(self) -> None:
+        """Atomically persist the virtual ledger to disk using tmp-then-rename."""
+        if not self._db_path:
+            return
+        state = {
+            "starting_cash": self.starting_cash,
+            "cash": self.cash,
+            "positions": {
+                sym: {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                    "realized_pnl": p.realized_pnl,
+                    "lot_size": p.lot_size,
+                    "instrument_type": p.instrument_type,
+                    "contract": p.contract,
+                }
+                for sym, p in self.positions.items()
+            },
+            "fills": self.fills,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(self._db_path)), exist_ok=True)
+        tmp = self._db_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, self._db_path)
+
+    def _load_ledger(self) -> bool:
+        """
+        Restore the virtual ledger from disk. Safe against missing or corrupt files.
+        Returns True when a prior session's state was successfully loaded.
+        """
+        if not self._db_path or not os.path.exists(self._db_path):
+            return False
+        try:
+            with open(self._db_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as exc:
+            logger.warning("[PAPER] Cannot load ledger from %s: %s", self._db_path, exc)
+            return False
+        self.cash = float(state.get("cash", self.starting_cash))
+        self.fills = list(state.get("fills") or [])
+        self.positions = {}
+        for sym, d in (state.get("positions") or {}).items():
+            try:
+                self.positions[sym] = PaperPosition(
+                    symbol=d["symbol"],
+                    quantity=float(d.get("quantity", 0.0)),
+                    avg_price=float(d.get("avg_price", 0.0)),
+                    realized_pnl=float(d.get("realized_pnl", 0.0)),
+                    lot_size=int(d.get("lot_size", 1)),
+                    instrument_type=str(d.get("instrument_type", "EQ")),
+                    contract=dict(d.get("contract") or {}),
+                )
+            except Exception as exc:
+                logger.warning("[PAPER] Skipping corrupt position %s in ledger: %s", sym, exc)
+        logger.info(
+            "[PAPER] Restored ledger from %s: cash=%.2f positions=%d fills=%d",
+            self._db_path, self.cash, len(self.positions), len(self.fills),
+        )
+        return True
 
     # ----- pricing -------------------------------------------------------
 
@@ -229,6 +298,7 @@ class PaperBrokerAdapter:
             "price": fill_price,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        self._save_ledger()
 
         # This log line is the audit trail proving the live order API was bypassed.
         logger.info(
@@ -329,3 +399,4 @@ class PaperBrokerAdapter:
         self.positions.clear()
         self.fills.clear()
         logger.info("[PAPER] Virtual ledger reset to %.2f", self.starting_cash)
+        self._save_ledger()
