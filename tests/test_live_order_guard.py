@@ -136,8 +136,11 @@ def _install_api_mocks():
     mock_pydantic.Field = lambda default=None, *a, **kw: default
     sys.modules.setdefault("pydantic", mock_pydantic)
 
+    from datetime import timezone as _builtin_tz
     mock_pytz = MagicMock()
-    mock_pytz.timezone = MagicMock(return_value=MagicMock())
+    # Return a real tzinfo (UTC) so datetime.now(IST) never raises TypeError,
+    # regardless of which test file's mock wins the sys.modules.setdefault() race.
+    mock_pytz.timezone = MagicMock(return_value=_builtin_tz.utc)
     sys.modules.setdefault("pytz", mock_pytz)
 
     sys.modules.setdefault("dotenv", MagicMock())
@@ -317,13 +320,15 @@ class TestExecutionModeController(unittest.TestCase):
 
     def test_set_live_raises_http_403(self):
         ctrl = self._make_controller()
-        with self.assertRaises(_APIHTTPException) as ctx:
+        # Use the HTTPException class that trading.py actually imported to avoid
+        # class-identity mismatch when multiple test files share sys.modules mocks.
+        with self.assertRaises(_TRADING_MOD.HTTPException) as ctx:
             ctrl.set("LIVE")
         self.assertEqual(ctx.exception.status_code, 403)
 
     def test_set_live_lowercase_raises_http_403(self):
         ctrl = self._make_controller()
-        with self.assertRaises(_APIHTTPException) as ctx:
+        with self.assertRaises(_TRADING_MOD.HTTPException) as ctx:
             ctrl.set("live")
         self.assertEqual(ctx.exception.status_code, 403)
 
@@ -334,7 +339,7 @@ class TestExecutionModeController(unittest.TestCase):
 
     def test_set_invalid_mode_raises_http_400(self):
         ctrl = self._make_controller()
-        with self.assertRaises(_APIHTTPException) as ctx:
+        with self.assertRaises(_TRADING_MOD.HTTPException) as ctx:
             ctrl.set("SIMULATION")
         self.assertEqual(ctx.exception.status_code, 400)
 
