@@ -1,3 +1,4 @@
+from .regime_classifier import RegimeClassifier, RegimeLabel, RegimeResult
 from .tick_buffer import TickBuffer, tick_buffer
 from .market_session import MarketSession, market_session
 from .stale_feed_detector import StaleFeedDetector, stale_feed_detector
@@ -21,6 +22,9 @@ from .indicators import (
 )
 
 __all__ = [
+    "RegimeClassifier",
+    "RegimeLabel",
+    "RegimeResult",
     "TickBuffer",
     "tick_buffer",
     "MarketSession",
