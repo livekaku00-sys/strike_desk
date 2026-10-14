@@ -243,12 +243,12 @@ def record_fill_in_risk(order, update, order_id: str, fill_price: float, categor
             realized = float(meta["realized_pnl"])
         segment = "FNO" if category in _FNO_CATEGORIES else "EQUITY"
         trade_type = "FNO" if segment == "FNO" else "INTRADAY"
-        # Charges are computed only for exit fills (realized != 0).  Entry fills
-        # carry realized=0, charges=0, net_pnl=0 — the neutral sentinel used by
-        # RiskStateManager.record_trade() to skip consecutive-loss tracking for
-        # positions that are not yet closed.
+        # Charges are computed for exit fills (realized != 0) and for confirmed
+        # full-position closures even when realized == 0 (breakeven exits).
+        # Entry fills carry realized=0, charges=0, net_pnl=0 — the neutral sentinel
+        # used by RiskStateManager.record_trade() to skip consecutive-loss tracking.
         charges = 0.0
-        if realized != 0.0:
+        if realized != 0.0 or meta.get("position_closed"):
             turnover = float(units) * fill_price
             charges = _CC.calculate_total_charges(
                 turnover=turnover,

@@ -511,5 +511,163 @@ class TestRiskStateChargesAccumulation(unittest.TestCase):
         self.assertEqual(state.last_trade_result, "LOSS")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Part E — Breakeven exit charges (S03-BREAKEVEN-FIX regression tests)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBreakevenExitCharges(unittest.TestCase):
+    """
+    Regression tests for DEFECT-1: a full-position closure at entry price
+    (realized_pnl == 0.0) must still produce non-zero charges because the
+    exchange does not waive fees for breakeven trades.
+
+    The fix:
+      1. adapters/paper_broker.py — set metadata["position_closed"] = True when
+         the fill reduces a position from non-zero to exactly zero.
+      2. api/routes/trading.py   — change guard to
+         `if realized != 0.0 or meta.get("position_closed"):`.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if _TRADING_MOD is None:
+            raise unittest.SkipTest("api.routes.trading could not be loaded — skipping")
+
+    # ── helpers shared with TestRecordFillInRiskCharges ─────────────────────
+
+    def _make_order(self, symbol="NIFTY25000CE", quantity=1, side_str="SELL"):
+        from models.order import OrderSide
+        order = MagicMock()
+        order.symbol = symbol
+        order.quantity = quantity
+        order.side = OrderSide.SELL if side_str == "SELL" else OrderSide.BUY
+        return order
+
+    def _make_update(self, lot_size=50, realized_pnl=None, position_closed=False):
+        update = MagicMock()
+        meta = {"lot_size": lot_size, "position_closed": position_closed}
+        if realized_pnl is not None:
+            meta["realized_pnl"] = realized_pnl
+        update.metadata = meta
+        return update
+
+    def _call_record_fill(self, order, update, realized_from_rm, order_id, fill_price, category):
+        captured = {}
+        mock_rm = MagicMock()
+        mock_rm.apply_fill.return_value = realized_from_rm
+        mock_rm.get_risk_summary.return_value = {
+            "trade_count": 0, "open_positions_count": 0,
+            "realized_pnl": 0.0, "total_risk_pnl": 0.0,
+        }
+        mock_cb = MagicMock()
+        def capture_trade(trade):
+            captured["trade"] = trade
+        mock_cb.on_trade_completed.side_effect = capture_trade
+        with patch.dict("sys.modules", {
+            "risk.risk_manager": MagicMock(risk_manager=mock_rm),
+            "risk.circuit_breaker": MagicMock(circuit_breaker=mock_cb),
+        }):
+            _TRADING_MOD.record_fill_in_risk(order, update, order_id, fill_price, category)
+        return captured.get("trade")
+
+    # ── core breakeven tests ─────────────────────────────────────────────────
+
+    def test_breakeven_full_exit_fno_charges_nonzero(self):
+        """
+        Breakeven F&O exit: realized=0.0 but position_closed=True.
+        Charges must be > 0 (brokerage + exchange + GST + SEBI at minimum).
+        """
+        order = self._make_order(side_str="SELL")
+        # realized_pnl=0 (breakeven), position_closed=True
+        update = self._make_update(lot_size=50, realized_pnl=0.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-001", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertGreater(trade.charges, 0.0,
+            "Breakeven F&O exit must produce non-zero charges")
+
+    def test_breakeven_full_exit_net_pnl_negative(self):
+        """
+        Breakeven exit: net_pnl = realized(0) - charges < 0.
+        The trade is an economic loss even though realized P&L is zero.
+        """
+        order = self._make_order(side_str="SELL")
+        update = self._make_update(lot_size=50, realized_pnl=0.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-002", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertLess(trade.net_pnl, 0.0,
+            "Breakeven exit net_pnl must be negative due to charges")
+
+    def test_breakeven_full_exit_net_pnl_equals_minus_charges(self):
+        """net_pnl = realized_pnl - charges = 0 - charges."""
+        order = self._make_order(side_str="SELL")
+        update = self._make_update(lot_size=50, realized_pnl=0.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-003", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertAlmostEqual(trade.net_pnl, trade.realized_pnl - trade.charges, places=4)
+
+    def test_entry_fill_no_position_closed_charges_zero(self):
+        """
+        Opening fill: position_closed=False (default), realized=0.
+        Charges must remain zero — the neutral sentinel must be preserved.
+        """
+        order = self._make_order(side_str="BUY")
+        update = self._make_update(lot_size=50, realized_pnl=None, position_closed=False)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-004", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertEqual(trade.charges, 0.0,
+            "Opening fill must not receive charges (neutral sentinel)")
+        self.assertEqual(trade.net_pnl, 0.0,
+            "Opening fill net_pnl must be 0 (neutral sentinel)")
+
+    def test_profitable_exit_with_position_closed_charges_nonzero(self):
+        """
+        Non-breakeven profitable exit with position_closed=True.
+        Both realized != 0 and position_closed, charges still computed.
+        """
+        order = self._make_order(side_str="SELL")
+        update = self._make_update(lot_size=50, realized_pnl=500.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-005", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertGreater(trade.charges, 0.0)
+        self.assertAlmostEqual(trade.net_pnl, 500.0 - trade.charges, places=4)
+
+    def test_losing_exit_with_position_closed_charges_nonzero(self):
+        """
+        Non-breakeven losing exit with position_closed=True.
+        Charges still computed, net_pnl is more negative than realized.
+        """
+        order = self._make_order(side_str="SELL")
+        update = self._make_update(lot_size=50, realized_pnl=-200.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-006", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertGreater(trade.charges, 0.0)
+        self.assertLess(trade.net_pnl, -200.0,
+            "net_pnl must be more negative than realized due to charges")
+
+    def test_partial_exit_no_position_closed_flag_but_realized_nonzero(self):
+        """
+        Partial reduction: position still open, position_closed=False.
+        realized != 0 so charges are computed via the existing path.
+        """
+        order = self._make_order(side_str="SELL")
+        update = self._make_update(lot_size=50, realized_pnl=250.0, position_closed=False)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-007", 150.0, "OPTIONS")
+        self.assertIsNotNone(trade)
+        self.assertGreater(trade.charges, 0.0)
+
+    def test_breakeven_equity_intraday_full_exit_charges_nonzero(self):
+        """
+        Breakeven full exit on EQUITY INTRADAY (not just F&O).
+        Charges must apply (brokerage + STT on sell + exchange + GST + SEBI).
+        """
+        order = self._make_order(symbol="RELIANCE", quantity=100, side_str="SELL")
+        update = self._make_update(lot_size=1, realized_pnl=0.0, position_closed=True)
+        trade = self._call_record_fill(order, update, 0.0, "BRK-008", 2500.0, "EQUITY")
+        self.assertIsNotNone(trade)
+        self.assertGreater(trade.charges, 0.0,
+            "Breakeven equity exit must produce non-zero charges")
+        self.assertLess(trade.net_pnl, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

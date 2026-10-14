@@ -284,10 +284,15 @@ class PaperBrokerAdapter:
         from execution.contract_store import IDENTITY_KEYS
         contract = {k: v for k, v in (order.metadata or {}).items()
                     if k in IDENTITY_KEYS and v not in (None, "")}
+        sym_upper = order.symbol.strip().upper()
+        pre_fill_qty = self.positions[sym_upper].quantity if sym_upper in self.positions else 0.0
         realized_delta = self._apply_fill(
             order.symbol, signed, fill_price, lot_size=lot_size,
             instrument_type=instrument_type_str, contract=contract,
         )
+        post_pos = self.positions.get(sym_upper)
+        post_qty = post_pos.quantity if post_pos is not None else 0.0
+        position_closed = (pre_fill_qty != 0.0) and (post_qty == 0.0)
 
         broker_order_id = f"PAPER_{order.client_order_id}"
         self.fills.append({
@@ -321,7 +326,8 @@ class PaperBrokerAdapter:
             # lot_size / realized_pnl let the risk managers book this fill in units
             # (lots × lot_size) with the same P&L the ledger computed.
             metadata={"simulated": True, "broker": PAPER_BROKER_NAME,
-                      "lot_size": lot_size, "realized_pnl": realized_delta},
+                      "lot_size": lot_size, "realized_pnl": realized_delta,
+                      "position_closed": position_closed},
         )
 
     def _apply_fill(
