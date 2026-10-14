@@ -109,6 +109,7 @@ def _load_trading_module():
         mod = types.ModuleType(pkg)
         mod.__package__ = "api.routes"
         mod.__spec__ = spec
+        mod.__file__ = fpath
         sys.modules[pkg] = mod
         spec.loader.exec_module(mod)
         return mod
