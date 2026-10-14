@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import logging
+import math
 import re
 from typing import Any, Dict, Optional
 from models.tick import Tick
@@ -11,6 +12,8 @@ FUTURES_PATTERN = re.compile(r"(FUT$|[\s_-]FUT)")
 # Pure index names: no CE/PE, no FUT, no expiry digits — pure alpha or alpha+digits-free
 # Examples: NIFTY, BANKNIFTY, SENSEX, FINNIFTY, MIDCPNIFTY, NIFTYNXT50, BANKEX
 INDEX_BASE_PATTERN = re.compile(r"^[A-Z]+(?:50|NXT50|NIFTY|NEXT50)?$")
+# Fyers-style fully-qualified index symbols end with "-INDEX" (e.g. "NSE:NIFTY50-INDEX")
+_FYERS_INDEX_SUFFIX = re.compile(r"-INDEX$", re.IGNORECASE)
 _KNOWN_INDICES = frozenset({
     "NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY",
     "NIFTYNXT50", "BANKEX", "NIFTYIT", "NIFTYMIDCAP",
@@ -35,12 +38,17 @@ def _parse_timestamp(raw_time: Any) -> datetime:
 
 def detect_instrument_type(symbol: str) -> str:
     upper = symbol.strip().upper()
-    if OPTION_PATTERN.search(upper):
+    # Strip exchange prefix (e.g. "NSE:", "BSE:") before pattern matching
+    bare = upper.split(":", 1)[-1] if ":" in upper else upper
+    if OPTION_PATTERN.search(bare):
         return "OPT"
-    if FUTURES_PATTERN.search(upper):
+    if FUTURES_PATTERN.search(bare):
         return "FUT"
-    # Pure index names (no date/strike suffix) — classify before falling to EQ
-    if upper in _KNOWN_INDICES:
+    # Fyers fully-qualified index symbols end with "-INDEX" (e.g. "NSE:NIFTY50-INDEX")
+    if _FYERS_INDEX_SUFFIX.search(bare):
+        return "IDX_FUT"
+    # Short canonical index names (no date/strike suffix)
+    if upper in _KNOWN_INDICES or bare in _KNOWN_INDICES:
         return "IDX_FUT"
     return "EQ"
 
@@ -152,16 +160,38 @@ class TickNormalizer:
         pdoi = float(raw.get("pdoi") or 0.0)
         oi_change = float(raw.get("oi_change") or (oi - pdoi if pdoi > 0 else 0.0))
 
+        # Use None-aware key selection so an explicitly provided 0.0 is not silently
+        # skipped in favour of an alternate key (the old `or` chain had this bug).
+        raw_bid = raw.get("bid") if "bid" in raw else raw.get("bid_price")
+        raw_ask = raw.get("ask") if "ask" in raw else raw.get("ask_price")
+        raw_bqty = raw.get("bqty") if "bqty" in raw else raw.get("bid_qty")
+        raw_aqty = raw.get("aqty") if "aqty" in raw else raw.get("ask_qty")
+
+        bid_price = float(raw_bid) if raw_bid is not None else 0.0
+        ask_price = float(raw_ask) if raw_ask is not None else 0.0
+        bid_qty = float(raw_bqty) if raw_bqty is not None else 0.0
+        ask_qty = float(raw_aqty) if raw_aqty is not None else 0.0
+
+        # bid_ask_valid: True only when both sides are finite, strictly positive, and
+        # the instrument type has an order book.  Index instruments (IDX_FUT) never
+        # carry a real order book on Fyers — the fields are absent or zero.
+        bid_ask_valid = (
+            inst_type != "IDX_FUT"
+            and math.isfinite(bid_price) and bid_price > 0.0
+            and math.isfinite(ask_price) and ask_price > 0.0
+        )
+
         return Tick(
             symbol=symbol,
             exchange=exchange,
             instrument_type=inst_type,
             timestamp=ts,
             ltp=float(raw.get("ltp") or 0.0),
-            bid_price=float(raw.get("bid") or raw.get("bid_price") or 0.0),
-            ask_price=float(raw.get("ask") or raw.get("ask_price") or 0.0),
-            bid_qty=float(raw.get("bqty") or raw.get("bid_qty") or 0.0),
-            ask_qty=float(raw.get("aqty") or raw.get("ask_qty") or 0.0),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            bid_qty=bid_qty,
+            ask_qty=ask_qty,
+            bid_ask_valid=bid_ask_valid,
             volume=float(raw.get("vol_traded_today") or raw.get("volume") or 0.0),
             total_buy_qty=float(raw.get("tot_buy_gbd") or raw.get("total_buy_qty") or 0.0),
             total_sell_qty=float(raw.get("tot_sell_gbd") or raw.get("total_sell_qty") or 0.0),

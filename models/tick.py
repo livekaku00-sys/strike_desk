@@ -26,6 +26,10 @@ class Tick:
     oi_change: float = 0.0
     late: bool = False
     source: str = "live"
+    # True only when bid_price and ask_price are both finite, positive, and from
+    # an instrument type that has an order book.  False for index instruments and
+    # any tick where bid/ask were absent, zero, or non-finite in the raw payload.
+    bid_ask_valid: bool = False
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
