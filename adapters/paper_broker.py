@@ -12,7 +12,9 @@ feed, the order is rejected rather than filled at a guessed price.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +23,11 @@ from models.order import Order, OrderSide, OrderState, OrderUpdate
 logger = logging.getLogger(__name__)
 
 PAPER_BROKER_NAME = "paper"
+
+
+def _get_audit_logger():
+    from execution.audit_logger import audit_logger
+    return audit_logger
 
 
 @dataclass
@@ -67,7 +74,7 @@ class PaperBrokerAdapter:
     execution path calls on an adapter.
     """
 
-    def __init__(self, ltp_provider, starting_cash: float = 1_000_000.0, tick_provider=None) -> None:
+    def __init__(self, ltp_provider, starting_cash: float = 1_000_000.0, tick_provider=None, db_path: Optional[str] = None) -> None:
         # `ltp_provider(symbol) -> Optional[float]` reads the live tick store.
         # `tick_provider(symbol) -> Optional[Tick]` used when source validation is required (P0-09).
         self._ltp_provider = ltp_provider
@@ -77,6 +84,73 @@ class PaperBrokerAdapter:
         self.cash = starting_cash
         self.positions: Dict[str, PaperPosition] = {}
         self.fills: List[Dict[str, Any]] = []
+        self._db_path = db_path
+        if self._db_path:
+            self._load_ledger()
+
+    # ----- disk persistence ----------------------------------------------
+
+    def _save_ledger(self) -> None:
+        """Atomically persist the virtual ledger to disk using tmp-then-rename."""
+        if not self._db_path:
+            return
+        state = {
+            "starting_cash": self.starting_cash,
+            "cash": self.cash,
+            "positions": {
+                sym: {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                    "realized_pnl": p.realized_pnl,
+                    "lot_size": p.lot_size,
+                    "instrument_type": p.instrument_type,
+                    "contract": p.contract,
+                }
+                for sym, p in self.positions.items()
+            },
+            "fills": self.fills,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(self._db_path)), exist_ok=True)
+        tmp = self._db_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, self._db_path)
+
+    def _load_ledger(self) -> bool:
+        """
+        Restore the virtual ledger from disk. Safe against missing or corrupt files.
+        Returns True when a prior session's state was successfully loaded.
+        """
+        if not self._db_path or not os.path.exists(self._db_path):
+            return False
+        try:
+            with open(self._db_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as exc:
+            logger.warning("[PAPER] Cannot load ledger from %s: %s", self._db_path, exc)
+            return False
+        self.cash = float(state.get("cash", self.starting_cash))
+        self.fills = list(state.get("fills") or [])
+        self.positions = {}
+        for sym, d in (state.get("positions") or {}).items():
+            try:
+                self.positions[sym] = PaperPosition(
+                    symbol=d["symbol"],
+                    quantity=float(d.get("quantity", 0.0)),
+                    avg_price=float(d.get("avg_price", 0.0)),
+                    realized_pnl=float(d.get("realized_pnl", 0.0)),
+                    lot_size=int(d.get("lot_size", 1)),
+                    instrument_type=str(d.get("instrument_type", "EQ")),
+                    contract=dict(d.get("contract") or {}),
+                )
+            except Exception as exc:
+                logger.warning("[PAPER] Skipping corrupt position %s in ledger: %s", sym, exc)
+        logger.info(
+            "[PAPER] Restored ledger from %s: cash=%.2f positions=%d fills=%d",
+            self._db_path, self.cash, len(self.positions), len(self.fills),
+        )
+        return True
 
     # ----- pricing -------------------------------------------------------
 
@@ -215,10 +289,15 @@ class PaperBrokerAdapter:
         from execution.contract_store import IDENTITY_KEYS
         contract = {k: v for k, v in (order.metadata or {}).items()
                     if k in IDENTITY_KEYS and v not in (None, "")}
+        sym_upper = order.symbol.strip().upper()
+        pre_fill_qty = self.positions[sym_upper].quantity if sym_upper in self.positions else 0.0
         realized_delta = self._apply_fill(
             order.symbol, signed, fill_price, lot_size=lot_size,
             instrument_type=instrument_type_str, contract=contract,
         )
+        post_pos = self.positions.get(sym_upper)
+        post_qty = post_pos.quantity if post_pos is not None else 0.0
+        position_closed = (pre_fill_qty != 0.0) and (post_qty == 0.0)
 
         broker_order_id = f"PAPER_{order.client_order_id}"
         self.fills.append({
@@ -229,6 +308,7 @@ class PaperBrokerAdapter:
             "price": fill_price,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        self._save_ledger()
 
         # This log line is the audit trail proving the live order API was bypassed.
         logger.info(
@@ -237,6 +317,32 @@ class PaperBrokerAdapter:
             order.side.value, order.symbol, qty, fill_price,
             self.cash, self.positions.get(order.symbol.upper(), PaperPosition(order.symbol)).quantity,
         )
+
+        _signal_id = str((order.metadata or {}).get("signal_id", ""))
+        try:
+            _get_audit_logger().log_order_transition(
+                client_order_id=order.client_order_id,
+                symbol=order.symbol,
+                broker=PAPER_BROKER_NAME,
+                old_state=OrderState.PENDING.value,
+                new_state=OrderState.SUBMITTED.value,
+                reason="paper order routed to virtual ledger; no broker API called",
+                signal_id=_signal_id,
+            )
+            _get_audit_logger().log_order_transition(
+                client_order_id=order.client_order_id,
+                symbol=order.symbol,
+                broker=PAPER_BROKER_NAME,
+                old_state=OrderState.SUBMITTED.value,
+                new_state=OrderState.FILLED.value,
+                reason="simulated fill; no broker order API called",
+                fill_price=fill_price,
+                fill_qty=qty,
+                order_id=broker_order_id,
+                signal_id=_signal_id,
+            )
+        except Exception as _audit_exc:
+            logger.warning("[PAPER] Audit log failed: %s", _audit_exc)
 
         return OrderUpdate(
             client_order_id=order.client_order_id,
@@ -251,7 +357,8 @@ class PaperBrokerAdapter:
             # lot_size / realized_pnl let the risk managers book this fill in units
             # (lots × lot_size) with the same P&L the ledger computed.
             metadata={"simulated": True, "broker": PAPER_BROKER_NAME,
-                      "lot_size": lot_size, "realized_pnl": realized_delta},
+                      "lot_size": lot_size, "realized_pnl": realized_delta,
+                      "position_closed": position_closed},
         )
 
     def _apply_fill(
@@ -329,3 +436,4 @@ class PaperBrokerAdapter:
         self.positions.clear()
         self.fills.clear()
         logger.info("[PAPER] Virtual ledger reset to %.2f", self.starting_cash)
+        self._save_ledger()

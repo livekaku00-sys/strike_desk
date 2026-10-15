@@ -12,6 +12,7 @@ from models.order import (
     OrderType,
     OrderUpdate,
     ProductType,
+    TERMINAL_STATES,
 )
 from utils.order_id_generator import (
     compute_order_signature,
@@ -182,6 +183,7 @@ class OrderManager:
             old_state=OrderState.PENDING.value,
             new_state=OrderState.SUBMITTED.value,
             reason="order dispatched to broker",
+            signal_id=str((order.metadata or {}).get("signal_id", "")),
         )
 
         try:
@@ -215,6 +217,7 @@ class OrderManager:
                 new_state=OrderState.UNKNOWN.value,
                 reason="timeout after submission; querying broker to resolve",
                 order_id=order.broker_order_id or "",
+                signal_id=str((order.metadata or {}).get("signal_id", "")),
             )
 
             # Query broker to resolve — must not resubmit
@@ -258,6 +261,7 @@ class OrderManager:
                 old_state=prev_state.value,
                 new_state=OrderState.REJECTED.value,
                 reason=(raw_msg or "")[:200],
+                signal_id=str((order.metadata or {}).get("signal_id", "")),
             )
             return rej_update
 
@@ -327,42 +331,80 @@ class OrderManager:
 
         old_state = order.state
 
+        # Drop fill updates for orders already in a terminal state.  A delayed
+        # or duplicate fill from the broker must never reopen or overfill an
+        # order that has already settled.
+        if old_state in TERMINAL_STATES and (
+            (update.last_fill_qty > 0 and update.last_fill_price > 0)
+            or update.filled_qty > order.filled_qty
+        ):
+            logger.warning(
+                "[%s] Dropping fill update (last_fill_qty=%s, filled_qty=%s) "
+                "for order already in terminal state %s.",
+                order.client_order_id,
+                update.last_fill_qty,
+                update.filled_qty,
+                old_state.value,
+            )
+            return update
+
+        # effective_update tracks what was actually booked; replaced by the
+        # post-clamp OrderUpdate from apply_fill() in fill branches so that
+        # dispatch and callers see accepted quantities, not broker-reported ones.
+        effective_update = update
+
         if update.last_fill_qty > 0 and update.last_fill_price > 0:
-            order.apply_fill(
+            fill_result = order.apply_fill(
                 fill_qty=update.last_fill_qty,
                 fill_price=update.last_fill_price,
                 timestamp=update.timestamp,
                 broker_order_id=update.broker_order_id,
             )
+            effective_update = fill_result
+            accepted_qty = fill_result.last_fill_qty
+            reason = "fill received"
+            if accepted_qty != update.last_fill_qty:
+                reason = (
+                    f"fill received; broker reported qty={update.last_fill_qty}, "
+                    f"accepted qty={accepted_qty} (clamped)"
+                )
             _get_audit_logger().log_order_transition(
                 client_order_id=order.client_order_id,
                 symbol=order.symbol,
                 broker=order.broker,
                 old_state=old_state.value,
                 new_state=order.state.value,
-                reason="fill received",
+                reason=reason,
                 fill_price=update.last_fill_price,
-                fill_qty=update.last_fill_qty,
+                fill_qty=accepted_qty,
                 order_id=update.broker_order_id or "",
             )
         elif update.filled_qty > order.filled_qty:
             additional_fill = update.filled_qty - order.filled_qty
             avg_price = update.avg_fill_price if update.avg_fill_price > 0 else order.price
-            order.apply_fill(
+            fill_result = order.apply_fill(
                 fill_qty=additional_fill,
                 fill_price=avg_price,
                 timestamp=update.timestamp,
                 broker_order_id=update.broker_order_id,
             )
+            effective_update = fill_result
+            accepted_qty = fill_result.last_fill_qty
+            reason = "fill delta received"
+            if accepted_qty != additional_fill:
+                reason = (
+                    f"fill delta received; computed delta={additional_fill}, "
+                    f"accepted qty={accepted_qty} (clamped)"
+                )
             _get_audit_logger().log_order_transition(
                 client_order_id=order.client_order_id,
                 symbol=order.symbol,
                 broker=order.broker,
                 old_state=old_state.value,
                 new_state=order.state.value,
-                reason="fill delta received",
+                reason=reason,
                 fill_price=avg_price,
-                fill_qty=additional_fill,
+                fill_qty=accepted_qty,
                 order_id=update.broker_order_id or "",
             )
         elif update.state != order.state:
@@ -384,8 +426,8 @@ class OrderManager:
                 order_id=update.broker_order_id or "",
             )
 
-        self._dispatch_update(update)
-        return update
+        self._dispatch_update(effective_update)
+        return effective_update
 
     def _dispatch_update(self, update: OrderUpdate) -> None:
         for listener in self._listeners:

@@ -324,6 +324,13 @@ class StrategyOrchestrator:
                                 "[PIPELINE TRACE] J3 Risk Gate: symbol=%s -> DROPPED (reason=%s)",
                                 sig.symbol, _risk_reason,
                             )
+                            self.audit_logger.log_risk_rejection(
+                                symbol=sig.symbol,
+                                broker="",
+                                rule_violated="PRE_SIGNAL_RISK_GATE",
+                                reason=_risk_reason or "risk gate rejected signal",
+                                signal_id=sig.signal_id,
+                            )
                         else:
                             logger.critical(
                                 "[PIPELINE TRACE] J3 Risk Gate: symbol=%s -> PASSED",

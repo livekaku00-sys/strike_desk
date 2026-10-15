@@ -450,11 +450,37 @@ class AuditLogger:
         with self._lock:
             return list(self._entries)
 
+    def log_market_data_event(
+        self,
+        symbol: str,
+        event_subtype: str,
+        reason: str,
+        ltp: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Record market-data pipeline events: invalid LTP, out-of-order tick, feed gap."""
+        entry = {
+            "event_type": "market_data_event",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "event_subtype": event_subtype,
+            "reason": reason,
+            "ltp": ltp,
+            "action": event_subtype,
+        }
+        return self._record(entry)
+
     def query_by_order_id(self, client_order_id: str) -> List[Dict[str, Any]]:
         with self._lock:
             return [
                 e for e in self._entries
                 if e.get("client_order_id") == client_order_id
+            ]
+
+    def query_by_signal_id(self, signal_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                e for e in self._entries
+                if e.get("signal_id") == signal_id
             ]
 
     def query_by_event_type(self, event_type: str, limit: int = 200) -> List[Dict[str, Any]]:

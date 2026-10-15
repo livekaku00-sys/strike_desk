@@ -41,6 +41,26 @@ class BaseIndicatorCalculator(ABC):
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
+        # 0. LTP validity gate — skip ticks whose price is invalid (NaN, Inf, zero).
+        #    ltp_valid is set by Tick.__post_init__ from the normalizer output.
+        if not tick.ltp_valid:
+            logger.warning(
+                "[%s] Skipping tick with invalid LTP: %r (ltp_valid=False)",
+                self.symbol,
+                tick.ltp,
+            )
+            try:
+                from execution.audit_logger import audit_logger as _audit_logger
+                _audit_logger.log_market_data_event(
+                    symbol=self.symbol,
+                    event_subtype="INVALID_LTP",
+                    reason=f"ltp_valid=False; ltp={tick.ltp!r}",
+                    ltp=tick.ltp,
+                )
+            except Exception:
+                pass
+            return dict(self.indicator_values)
+
         # 1. Out-of-order detection
         if self.last_tick_timestamp is not None:
             if ts < self.last_tick_timestamp:

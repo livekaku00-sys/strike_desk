@@ -308,135 +308,15 @@ async def _flatten_live(
     now_ist: str,
     _logger: Any,
 ) -> Dict[str, Any]:
-    """
-    Cancel non-terminal orders then close every open live position.  Never raises.
-    On timeout the outcome is TIMEOUT_UNKNOWN — callers must not resubmit blind.
-    """
-    from models.order import Order, OrderSide, OrderType
-
-    try:
-        from brokers.token_manager import BrokerTokenManager
-        active_broker = BrokerTokenManager().get_active_broker()
-    except Exception:
-        active_broker = "dhan"
-
-    try:
-        adapter = select_adapter(adapters, active_broker)
-    except HTTPException as exc:
-        return {
-            "mode": "LIVE",
-            "error": f"Broker adapter unavailable: {exc.detail}",
-            "live_cancels": [],
-            "live_closes": [],
-            "unresolved_symbols": [],
-            "closed_count": 0,
-            "failed_count": 0,
-            "executed_at": now_ist,
-            "event_id": event_id,
-        }
-
-    _CANCELABLE = frozenset({"PENDING", "SUBMITTED", "OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"})
-    cancels: List[Dict[str, Any]] = []
-    for oid, order_data in list(orders_db.items()):
-        stat = (order_data.get("status") or "").upper()
-        if stat not in _CANCELABLE:
-            continue
-        if not hasattr(adapter, "cancel_order"):
-            cancels.append({"order_id": oid, "outcome": "SKIPPED", "reason": "adapter_no_cancel"})
-            continue
-        try:
-            await asyncio.wait_for(
-                adapter.cancel_order(
-                    client_order_id=oid,
-                    broker_order_id=order_data.get("broker_order_id") or oid,
-                ),
-                timeout=10.0,
-            )
-            orders_db[oid]["status"] = "CANCELLED"
-            cancels.append({"order_id": oid, "outcome": "CANCELLED"})
-        except asyncio.TimeoutError:
-            cancels.append({
-                "order_id": oid,
-                "outcome": "TIMEOUT_UNKNOWN",
-                "warning": "Cancel timed out — verify at broker",
-            })
-            _logger.error("[FlattenAll] LIVE cancel %s: timeout — state unconfirmed", oid)
-        except Exception as exc:
-            cancels.append({"order_id": oid, "outcome": "FAILED", "reason": str(exc)[:200]})
-            _logger.error("[FlattenAll] LIVE cancel %s failed: %s", oid, exc)
-
-    closes: List[Dict[str, Any]] = []
-    for sym, pos_data in list(positions_db.items()):
-        qty = float(pos_data.get("qty") or pos_data.get("quantity") or 0.0)
-        if qty == 0:
-            continue
-        exit_side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-        exit_order = Order(
-            client_order_id=str(uuid.uuid4()),
-            symbol=sym,
-            exchange=pos_data.get("exchange", "NSE"),
-            side=exit_side,
-            order_type=OrderType.MARKET,
-            quantity=float(abs(qty)),
-            price=0.0,
-            broker=active_broker,
-        )
-        try:
-            update = await asyncio.wait_for(adapter.place_order(exit_order), timeout=15.0)
-            state_val = update.state.value if hasattr(update.state, "value") else str(update.state)
-            fill_px = float(getattr(update, "avg_fill_price", 0.0))
-            oid = getattr(update, "broker_order_id", exit_order.client_order_id)
-            if state_val == "FILLED":
-                record_fill(exit_order, update, oid, fill_px, mc.active_mode)
-                closes.append({
-                    "symbol": sym,
-                    "outcome": "FILLED",
-                    "fill_price": round(fill_px, 2),
-                    "order_id": oid,
-                })
-                _logger.warning("[FlattenAll] LIVE %s exit FILLED @ %.2f — FLATTEN ALL", sym, fill_px)
-            else:
-                closes.append({
-                    "symbol": sym,
-                    "outcome": "SUBMITTED_NOT_VERIFIED",
-                    "state": state_val,
-                    "warning": "Order submitted but fill not confirmed — verify at broker",
-                })
-                _logger.error(
-                    "[FlattenAll] LIVE %s exit status=%s — not FILLED; verify at broker", sym, state_val
-                )
-        except asyncio.TimeoutError:
-            closes.append({
-                "symbol": sym,
-                "outcome": "TIMEOUT_UNKNOWN",
-                "warning": "Exit timed out — DO NOT resubmit; verify at broker first",
-            })
-            _logger.error("[FlattenAll] LIVE %s exit TIMEOUT — state unconfirmed, do not resubmit", sym)
-        except Exception as exc:
-            closes.append({"symbol": sym, "outcome": "FAILED", "reason": str(exc)[:200]})
-            _logger.error("[FlattenAll] LIVE %s exit failed: %s", sym, exc)
-
-    unresolved = [
-        c.get("symbol") or c.get("order_id")
-        for c in (cancels + closes)
-        if c["outcome"] in ("TIMEOUT_UNKNOWN", "FAILED", "SUBMITTED_NOT_VERIFIED")
-    ]
-    return {
-        "mode": "LIVE",
-        "live_cancels": cancels,
-        "live_closes": closes,
-        "unresolved_symbols": unresolved,
-        "closed_count": sum(1 for c in closes if c["outcome"] == "FILLED"),
-        "failed_count": len(unresolved),
-        "executed_at": now_ist,
-        "event_id": event_id,
-    }
+    """Live order dispatch is permanently prohibited — this function always raises."""
+    from utils.live_order_guard import prohibit_live_order
+    prohibit_live_order("_flatten_live")
 
 
 async def _execute_flatten_positions(adapters: Dict[str, Any], event_id: str) -> Dict[str, Any]:
     """
-    Dispatch to paper or live flatten after the halt flag is already set.
-    Never raises — all exceptions are captured in per-item outcomes.
+    Flatten all open positions through the paper ledger.
+    Live order dispatch is permanently prohibited; the LIVE path raises unconditionally.
     """
     _logger = logging.getLogger(__name__)
     now_ist = datetime.now(IST).isoformat()
@@ -456,6 +336,8 @@ async def _execute_flatten_positions(adapters: Dict[str, Any], event_id: str) ->
             get_paper_broker(), _positions_db, record_fill_in_risk,
             _mc, event_id, now_ist, _logger,
         )
+    # This branch can only be reached if ExecutionModeController.set() is bypassed.
+    # _flatten_live raises LiveOrderProhibitedError unconditionally as a second layer.
     return await _flatten_live(
         adapters, _orders_db, _positions_db, record_fill_in_risk,
         _select_active_adapter, _mc, event_id, now_ist, _logger,
@@ -489,7 +371,16 @@ async def confirm_flatten_all(
         "event_id": event.event_id,
         "timestamp": datetime.now(IST).isoformat(),
     })
-    execution = await _execute_flatten_positions(adapters, event.event_id)
+    try:
+        execution = await _execute_flatten_positions(adapters, event.event_id)
+    except Exception as _exc:
+        from utils.live_order_guard import LiveOrderProhibitedError
+        if isinstance(_exc, LiveOrderProhibitedError):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Live order dispatch is permanently prohibited in this build.",
+            )
+        raise
     return {
         "success": True,
         "message": "FLATTEN ALL executed — halt engaged, positions closed.",

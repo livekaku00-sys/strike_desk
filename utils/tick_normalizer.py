@@ -1,8 +1,20 @@
 from datetime import datetime, timezone
 import logging
+import math
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from models.tick import Tick
+
+
+def _safe_float(value: Any, fallback: float = 0.0) -> float:
+    """Convert value to float, returning fallback for None, NaN, and Inf."""
+    if value is None:
+        return fallback
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return result if math.isfinite(result) else fallback
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +23,8 @@ FUTURES_PATTERN = re.compile(r"(FUT$|[\s_-]FUT)")
 # Pure index names: no CE/PE, no FUT, no expiry digits — pure alpha or alpha+digits-free
 # Examples: NIFTY, BANKNIFTY, SENSEX, FINNIFTY, MIDCPNIFTY, NIFTYNXT50, BANKEX
 INDEX_BASE_PATTERN = re.compile(r"^[A-Z]+(?:50|NXT50|NIFTY|NEXT50)?$")
+# Fyers-style fully-qualified index symbols end with "-INDEX" (e.g. "NSE:NIFTY50-INDEX")
+_FYERS_INDEX_SUFFIX = re.compile(r"-INDEX$", re.IGNORECASE)
 _KNOWN_INDICES = frozenset({
     "NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY",
     "NIFTYNXT50", "BANKEX", "NIFTYIT", "NIFTYMIDCAP",
@@ -33,14 +47,77 @@ def _parse_timestamp(raw_time: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _parse_timestamp_with_unit(
+    raw_time: Any,
+    expect_ms: bool,
+    broker: str = "",
+) -> Tuple[datetime, bool]:
+    """
+    Parse a broker timestamp with an explicit, documented epoch unit.
+
+    Returns (utc_datetime, synthetic) where synthetic=True means the exchange
+    timestamp was absent or unparseable and local receipt time was substituted.
+    Callers should set source="receipt_time" on the Tick when synthetic is True
+    so downstream consumers can distinguish event time from receipt time.
+
+    Parameters
+    ----------
+    raw_time : Any
+        Raw timestamp value from the broker payload.
+    expect_ms : bool
+        True when the broker documents epoch values as milliseconds (e.g. AngelOne).
+        False when epoch values are seconds (e.g. Dhan LTT, Fyers exch_feed_time).
+    broker : str
+        Broker name for log messages; does not affect parsing logic.
+    """
+    if raw_time is None:
+        logger.warning(
+            "[%s] Missing timestamp field; substituting local receipt time (UTC). "
+            "Downstream freshness checks may be inaccurate.",
+            broker or "broker",
+        )
+        return datetime.now(timezone.utc), True
+
+    if isinstance(raw_time, datetime):
+        if raw_time.tzinfo is None:
+            return raw_time.replace(tzinfo=timezone.utc), False
+        return raw_time.astimezone(timezone.utc), False
+
+    if isinstance(raw_time, (int, float)):
+        epoch_s = raw_time / 1000.0 if expect_ms else float(raw_time)
+        return datetime.fromtimestamp(epoch_s, tz=timezone.utc), False
+
+    if isinstance(raw_time, str):
+        try:
+            dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc), False
+        except Exception:
+            pass
+
+    logger.warning(
+        "[%s] Unparseable timestamp %r; substituting local receipt time (UTC). "
+        "Verify broker payload timestamp field and format.",
+        broker or "broker",
+        raw_time,
+    )
+    return datetime.now(timezone.utc), True
+
+
 def detect_instrument_type(symbol: str) -> str:
     upper = symbol.strip().upper()
-    if OPTION_PATTERN.search(upper):
+    # Strip exchange prefix (e.g. "NSE:", "BSE:") before pattern matching
+    bare = upper.split(":", 1)[-1] if ":" in upper else upper
+    if OPTION_PATTERN.search(bare):
         return "OPT"
-    if FUTURES_PATTERN.search(upper):
+    if FUTURES_PATTERN.search(bare):
         return "FUT"
-    # Pure index names (no date/strike suffix) — classify before falling to EQ
-    if upper in _KNOWN_INDICES:
+    # Fyers fully-qualified index symbols end with "-INDEX" (e.g. "NSE:NIFTY50-INDEX")
+    if _FYERS_INDEX_SUFFIX.search(bare):
+        return "IDX_FUT"
+    # Short canonical index names (no date/strike suffix)
+    if upper in _KNOWN_INDICES or bare in _KNOWN_INDICES:
         return "IDX_FUT"
     return "EQ"
 
@@ -75,28 +152,33 @@ class TickNormalizer:
         ask_price = float(asks[0].get("price", 0.0)) if asks and isinstance(asks[0], dict) else float(raw.get("ask", 0.0) or 0.0)
         ask_qty = float(asks[0].get("quantity", 0.0)) if asks and isinstance(asks[0], dict) else float(raw.get("ask_qty", 0.0) or 0.0)
 
-        ts = _parse_timestamp(raw.get("LTT") or raw.get("exchange_timestamp") or raw.get("timestamp"))
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("LTT") or raw.get("exchange_timestamp") or raw.get("timestamp"),
+            expect_ms=False,
+            broker="Dhan",
+        )
 
         return Tick(
             symbol=symbol,
             exchange=exchange,
             instrument_type=inst_type,
             timestamp=ts,
-            ltp=float(raw.get("LTP") or raw.get("ltp") or 0.0),
+            ltp=_safe_float(raw.get("LTP") if raw.get("LTP") is not None else raw.get("ltp")),
             bid_price=bid_price,
             ask_price=ask_price,
             bid_qty=bid_qty,
             ask_qty=ask_qty,
-            volume=float(raw.get("volume") or raw.get("vol") or 0.0),
-            total_buy_qty=float(raw.get("total_buy_quantity") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("total_sell_quantity") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open") or 0.0),
-            high=float(raw.get("high") or 0.0),
-            low=float(raw.get("low") or 0.0),
-            close=float(raw.get("close") or raw.get("prev_close") or 0.0),
-            vwap=float(raw.get("avg_price") or raw.get("atp") or raw.get("vwap") or 0.0),
-            oi=float(raw.get("OI") or raw.get("oi") or 0.0),
-            oi_change=float(raw.get("oi_change") or 0.0),
+            volume=_safe_float(raw.get("volume") if raw.get("volume") is not None else raw.get("vol")),
+            total_buy_qty=_safe_float(raw.get("total_buy_quantity") if raw.get("total_buy_quantity") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("total_sell_quantity") if raw.get("total_sell_quantity") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open")),
+            high=_safe_float(raw.get("high")),
+            low=_safe_float(raw.get("low")),
+            close=_safe_float(raw.get("close") if raw.get("close") is not None else raw.get("prev_close")),
+            vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else (raw.get("atp") if raw.get("atp") is not None else raw.get("vwap"))),
+            oi=_safe_float(raw.get("OI") if raw.get("OI") is not None else raw.get("oi")),
+            oi_change=_safe_float(raw.get("oi_change")),
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @staticmethod
@@ -116,8 +198,15 @@ class TickNormalizer:
         ask_price = float(asks[0].get("price", 0.0)) / _P if asks and isinstance(asks[0], dict) else 0.0
         ask_qty = float(asks[0].get("quantity", 0.0)) if asks and isinstance(asks[0], dict) else 0.0
 
-        ts = _parse_timestamp(raw.get("exchange_timestamp") or raw.get("timestamp"))
-        ltp = float(raw.get("last_traded_price") or raw.get("ltp") or 0.0) / _P
+        # AngelOne SmartWebSocket v2 sends exchange_timestamp as milliseconds epoch.
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("exchange_timestamp") or raw.get("timestamp"),
+            expect_ms=True,
+            broker="AngelOne",
+        )
+        # AngelOne sends all prices in paise; _safe_float then divide by 100.
+        _raw_ltp = raw.get("last_traded_price") if raw.get("last_traded_price") is not None else raw.get("ltp")
+        ltp = _safe_float(_raw_ltp) / _P
 
         return Tick(
             symbol=symbol,
@@ -129,16 +218,17 @@ class TickNormalizer:
             ask_price=ask_price,
             bid_qty=bid_qty,
             ask_qty=ask_qty,
-            volume=float(raw.get("volume_trade_for_the_day") or raw.get("volume") or 0.0),
-            total_buy_qty=float(raw.get("total_buy_quantity") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("total_sell_quantity") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open_price_of_the_day") or raw.get("open") or 0.0) / _P,
-            high=float(raw.get("high_price_of_the_day") or raw.get("high") or 0.0) / _P,
-            low=float(raw.get("low_price_of_the_day") or raw.get("low") or 0.0) / _P,
-            close=float(raw.get("closed_price") or raw.get("close") or 0.0) / _P,
-            vwap=float(raw.get("avg_price") or raw.get("vwap") or 0.0) / _P,
-            oi=float(raw.get("open_interest") or raw.get("oi") or 0.0),
-            oi_change=float(raw.get("oi_change") or 0.0),
+            volume=_safe_float(raw.get("volume_trade_for_the_day") if raw.get("volume_trade_for_the_day") is not None else raw.get("volume")),
+            total_buy_qty=_safe_float(raw.get("total_buy_quantity") if raw.get("total_buy_quantity") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("total_sell_quantity") if raw.get("total_sell_quantity") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open_price_of_the_day") if raw.get("open_price_of_the_day") is not None else raw.get("open")) / _P,
+            high=_safe_float(raw.get("high_price_of_the_day") if raw.get("high_price_of_the_day") is not None else raw.get("high")) / _P,
+            low=_safe_float(raw.get("low_price_of_the_day") if raw.get("low_price_of_the_day") is not None else raw.get("low")) / _P,
+            close=_safe_float(raw.get("closed_price") if raw.get("closed_price") is not None else raw.get("close")) / _P,
+            vwap=_safe_float(raw.get("avg_price") if raw.get("avg_price") is not None else raw.get("vwap")) / _P,
+            oi=_safe_float(raw.get("open_interest") if raw.get("open_interest") is not None else raw.get("oi")),
+            oi_change=_safe_float(raw.get("oi_change")),
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @staticmethod
@@ -147,31 +237,60 @@ class TickNormalizer:
         exchange = "BSE" if symbol.startswith("BSE:") else "NSE"
         inst_type = detect_instrument_type(symbol)
 
-        ts = _parse_timestamp(raw.get("exch_feed_time") or raw.get("timestamp"))
-        oi = float(raw.get("oi") or 0.0)
-        pdoi = float(raw.get("pdoi") or 0.0)
-        oi_change = float(raw.get("oi_change") or (oi - pdoi if pdoi > 0 else 0.0))
+        # Fyers sends exch_feed_time as seconds epoch (Unix timestamp).
+        ts, ts_synthetic = _parse_timestamp_with_unit(
+            raw.get("exch_feed_time") or raw.get("timestamp"),
+            expect_ms=False,
+            broker="Fyers",
+        )
+        oi = _safe_float(raw.get("oi"))
+        pdoi = _safe_float(raw.get("pdoi"))
+        _raw_oi_change = raw.get("oi_change")
+        oi_change = _safe_float(_raw_oi_change) if _raw_oi_change is not None else (oi - pdoi if pdoi > 0 else 0.0)
+
+        # Use None-aware key selection so an explicitly provided 0.0 is not silently
+        # skipped in favour of an alternate key (the old `or` chain had this bug).
+        raw_bid = raw.get("bid") if "bid" in raw else raw.get("bid_price")
+        raw_ask = raw.get("ask") if "ask" in raw else raw.get("ask_price")
+        raw_bqty = raw.get("bqty") if "bqty" in raw else raw.get("bid_qty")
+        raw_aqty = raw.get("aqty") if "aqty" in raw else raw.get("ask_qty")
+
+        bid_price = float(raw_bid) if raw_bid is not None else 0.0
+        ask_price = float(raw_ask) if raw_ask is not None else 0.0
+        bid_qty = float(raw_bqty) if raw_bqty is not None else 0.0
+        ask_qty = float(raw_aqty) if raw_aqty is not None else 0.0
+
+        # bid_ask_valid: True only when both sides are finite, strictly positive, and
+        # the instrument type has an order book.  Index instruments (IDX_FUT) never
+        # carry a real order book on Fyers — the fields are absent or zero.
+        bid_ask_valid = (
+            inst_type != "IDX_FUT"
+            and math.isfinite(bid_price) and bid_price > 0.0
+            and math.isfinite(ask_price) and ask_price > 0.0
+        )
 
         return Tick(
             symbol=symbol,
             exchange=exchange,
             instrument_type=inst_type,
             timestamp=ts,
-            ltp=float(raw.get("ltp") or 0.0),
-            bid_price=float(raw.get("bid") or raw.get("bid_price") or 0.0),
-            ask_price=float(raw.get("ask") or raw.get("ask_price") or 0.0),
-            bid_qty=float(raw.get("bqty") or raw.get("bid_qty") or 0.0),
-            ask_qty=float(raw.get("aqty") or raw.get("ask_qty") or 0.0),
-            volume=float(raw.get("vol_traded_today") or raw.get("volume") or 0.0),
-            total_buy_qty=float(raw.get("tot_buy_gbd") or raw.get("total_buy_qty") or 0.0),
-            total_sell_qty=float(raw.get("tot_sell_gbd") or raw.get("total_sell_qty") or 0.0),
-            open=float(raw.get("open_price") or raw.get("open") or 0.0),
-            high=float(raw.get("high_price") or raw.get("high") or 0.0),
-            low=float(raw.get("low_price") or raw.get("low") or 0.0),
-            close=float(raw.get("prev_close_price") or raw.get("close") or 0.0),
-            vwap=float(raw.get("atp") or raw.get("vwap") or 0.0),
+            ltp=_safe_float(raw.get("ltp")),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            bid_qty=bid_qty,
+            ask_qty=ask_qty,
+            bid_ask_valid=bid_ask_valid,
+            volume=_safe_float(raw.get("vol_traded_today") if raw.get("vol_traded_today") is not None else raw.get("volume")),
+            total_buy_qty=_safe_float(raw.get("tot_buy_gbd") if raw.get("tot_buy_gbd") is not None else raw.get("total_buy_qty")),
+            total_sell_qty=_safe_float(raw.get("tot_sell_gbd") if raw.get("tot_sell_gbd") is not None else raw.get("total_sell_qty")),
+            open=_safe_float(raw.get("open_price") if raw.get("open_price") is not None else raw.get("open")),
+            high=_safe_float(raw.get("high_price") if raw.get("high_price") is not None else raw.get("high")),
+            low=_safe_float(raw.get("low_price") if raw.get("low_price") is not None else raw.get("low")),
+            close=_safe_float(raw.get("prev_close_price") if raw.get("prev_close_price") is not None else raw.get("close")),
+            vwap=_safe_float(raw.get("atp") if raw.get("atp") is not None else raw.get("vwap")),
             oi=oi,
             oi_change=oi_change,
+            source="receipt_time" if ts_synthetic else "live",
         )
 
     @classmethod

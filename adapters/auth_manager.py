@@ -67,6 +67,14 @@ class AuthManager:
         lock = self._get_lock(broker_key)
 
         async with lock:
+            # Deduplication: a concurrent caller that completed while we waited on the
+            # lock may have already stored a fresh token — skip re-authentication.
+            if (self.store.has_token(broker_key)
+                    and not self.store.is_expired(broker_key,
+                                                  buffer_seconds=self.expiry_buffer_seconds)):
+                self._statuses[broker_key] = AuthStatus.AUTHENTICATED
+                return True
+
             self._statuses[broker_key] = AuthStatus.AUTHENTICATING
             attempt = 0
 
