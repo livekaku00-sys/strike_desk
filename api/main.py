@@ -475,6 +475,25 @@ async def _auto_execute_loop() -> None:
             # If any position is currently open, collect qualifying signals
             # into the queue for visibility but do NOT execute until the slot clears.
             _open_count = int(risk_summary.get("open_positions_count", 0))
+            # Layer 2: also block when a BUY entry order is in-flight but not yet
+            # reflected in risk_manager (SUBMITTED/OPEN/UNKNOWN orders produce no
+            # ActivePosition until the fill WebSocket callback fires).
+            if _open_count == 0:
+                try:
+                    from adapters.order_manager import order_manager as _om_gate
+                    from execution.entry_gate import (
+                        is_entry_blocked_by_inflight_orders as _inflight_gate,
+                    )
+                    _inflight_blocked, _inflight_reason = _inflight_gate(_om_gate)
+                    if _inflight_blocked:
+                        _open_count = 1
+                        logger.critical(
+                            "[PIPELINE TRACE] AutoExec WAITING: in-flight entry "
+                            "order blocks slot: %s",
+                            _inflight_reason,
+                        )
+                except Exception as _gate_exc:
+                    logger.warning("[AutoExec] in-flight gate check failed: %s", _gate_exc)
 
             # ── Collect and rank all qualifying signals ────────────────────
             # Phase 1: class-lock filter
