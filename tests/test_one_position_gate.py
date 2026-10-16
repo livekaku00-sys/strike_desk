@@ -59,7 +59,7 @@ UTC = timezone.utc
 _T0 = datetime(2026, 9, 21, 9, 30, 0, tzinfo=UTC)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 def _make_order(side: OrderSide, state: OrderState, cid: str | None = None) -> Order:
     return Order(
@@ -117,7 +117,7 @@ def _combined_gate(rm: RiskManager, om: OrderManager) -> tuple[bool, str]:
     return blocked, reason
 
 
-# ── Group A: RiskManager gate (Layer 1) ────────────────────────────────────────────
+# ── Group A: RiskManager gate (Layer 1) ──────────────────────────────────────────────
 
 class TestGroupA_RiskManagerGate(unittest.TestCase):
 
@@ -159,7 +159,7 @@ class TestGroupA_RiskManagerGate(unittest.TestCase):
         print("✓ [03] Closed RM position allows new entry (open_count=0)")
 
 
-# ── Group B: In-flight BUY order gate (Layer 2) ──────────────────────────────────────
+# ── Group B: In-flight BUY order gate (Layer 2) ───────────────────────────────────────
 
 class TestGroupB_InflightBuyOrderGate(unittest.TestCase):
 
@@ -199,7 +199,7 @@ class TestGroupB_InflightBuyOrderGate(unittest.TestCase):
         print("✓ [08] TIMEOUT BUY blocks entry")
 
 
-# ── Group C: Non-blocking cases ───────────────────────────────────────────────
+# ── Group C: Non-blocking cases ─────────────────────────────────────────────────────
 
 class TestGroupC_NonBlockingCases(unittest.TestCase):
 
@@ -244,7 +244,7 @@ class TestGroupC_NonBlockingCases(unittest.TestCase):
         print("✓ [12] REJECTED BUY does not block entry")
 
 
-# ── Group D: Edge case ───────────────────────────────────────────────────────────────────────────────────
+# ── Group D: Edge case ───────────────────────────────────────────────────────────────────────────────
 
 class TestGroupD_EdgeCases(unittest.TestCase):
 
@@ -269,7 +269,7 @@ class TestGroupD_EdgeCases(unittest.TestCase):
         print("✓ [13] PARTIALLY_FILLED BUY (no RM record yet) blocks entry")
 
 
-# ── Group E: Fail-closed safety ───────────────────────────────────────────────────────────────
+# ── Group E: Fail-closed safety ─────────────────────────────────────────────────────────────
 
 class TestGroupE_FailClosed(unittest.TestCase):
 
@@ -352,7 +352,7 @@ class TestGroupE_FailClosed(unittest.TestCase):
         print("✓ [17] Caller exception path sets _open_count=1 (fail-closed)")
 
 
-# ── Runner ──────────────────────────────────────────────────────────────────────────────────────────
+# ── Runner ─────────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 70)
