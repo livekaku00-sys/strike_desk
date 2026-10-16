@@ -12,6 +12,23 @@ Without this check, _open_count == 0 and the loop would attempt a second entry b
 the first order's fate is confirmed by the broker.
 
 Only BUY orders are checked. SELL orders are exits and never occupy the entry slot.
+
+PENDING-order architectural note
+---------------------------------
+The auto-execute loop constructs an Order(state=PENDING) and calls
+adapter.place_order() directly, bypassing order_manager.submit_order().  That
+order is therefore never registered in order_manager._orders and is invisible to
+get_open_orders() — so a PENDING BUY from the auto loop cannot be detected here.
+
+This is safe under the current architecture because:
+  1. _auto_execute_loop is a single asyncio coroutine; there is no parallel entry
+     coroutine that could fire a second entry during the await adapter.place_order()
+     window.
+  2. _executed_signal_ids.add() is called before the await, preventing the same
+     signal from being re-entered across the yield point.
+
+If a second automatic entry path is ever added, PENDING orders must be tracked
+explicitly (e.g. via order_manager.submit_order or a reservation set).
 """
 from __future__ import annotations
 
@@ -64,8 +81,11 @@ def is_entry_blocked_by_inflight_orders(order_manager: "OrderManager") -> Tuple[
             and getattr(o, "state", None) in inflight_states
         ]
     except Exception as exc:
-        logger.warning("[EntryGate] in-flight order query failed: %s", exc)
-        return False, ""
+        # Fail-closed: cannot confirm no order is in flight, so block entry.
+        logger.warning(
+            "[EntryGate] in-flight order query failed — blocking entry as safe default: %s", exc
+        )
+        return True, f"gate check failed: {exc}"
 
     if not inflight:
         return False, ""

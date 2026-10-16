@@ -11,7 +11,7 @@ position open at a time:
     — catches entry orders in SUBMITTED/OPEN/PARTIALLY_FILLED/CANCEL_PENDING/
     UNKNOWN/TIMEOUT that have no position record yet in RiskManager.
 
-13 test cases:
+17 test cases:
 
   Group A — RiskManager gate (Layer 1, existing logic, must stay passing)
   [01] Fresh state: no RM position, no open orders → allowed
@@ -33,6 +33,12 @@ position open at a time:
 
   Group D — Edge case
   [13] PARTIALLY_FILLED BUY with no RM position record → blocked by Layer 2
+
+  Group E — Fail-closed safety (tests for exception-handling corrections)
+  [14] EXPIRED terminal BUY → NOT blocked (terminal state)
+  [15] Multiple in-flight BUY orders → blocked; count reported accurately
+  [16] Exception from get_open_orders() → gate returns (True, ...) (fail-closed)
+  [17] Exception from gate itself → caller pattern sets _open_count=1 (fail-closed)
 """
 import os
 import sys
@@ -53,7 +59,7 @@ UTC = timezone.utc
 _T0 = datetime(2026, 9, 21, 9, 30, 0, tzinfo=UTC)
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────────────────────────────
 
 def _make_order(side: OrderSide, state: OrderState, cid: str | None = None) -> Order:
     return Order(
@@ -111,7 +117,7 @@ def _combined_gate(rm: RiskManager, om: OrderManager) -> tuple[bool, str]:
     return blocked, reason
 
 
-# ── Group A: RiskManager gate (Layer 1) ──────────────────────────────────────────────
+# ── Group A: RiskManager gate (Layer 1) ────────────────────────────────────────────
 
 class TestGroupA_RiskManagerGate(unittest.TestCase):
 
@@ -153,7 +159,7 @@ class TestGroupA_RiskManagerGate(unittest.TestCase):
         print("✓ [03] Closed RM position allows new entry (open_count=0)")
 
 
-# ── Group B: In-flight BUY order gate (Layer 2) ───────────────────────────────────────
+# ── Group B: In-flight BUY order gate (Layer 2) ──────────────────────────────────────
 
 class TestGroupB_InflightBuyOrderGate(unittest.TestCase):
 
@@ -193,7 +199,7 @@ class TestGroupB_InflightBuyOrderGate(unittest.TestCase):
         print("✓ [08] TIMEOUT BUY blocks entry")
 
 
-# ── Group C: Non-blocking cases ─────────────────────────────────────────────────────
+# ── Group C: Non-blocking cases ───────────────────────────────────────────────
 
 class TestGroupC_NonBlockingCases(unittest.TestCase):
 
@@ -238,7 +244,7 @@ class TestGroupC_NonBlockingCases(unittest.TestCase):
         print("✓ [12] REJECTED BUY does not block entry")
 
 
-# ── Group D: Edge case ───────────────────────────────────────────────────────────────────────────────
+# ── Group D: Edge case ───────────────────────────────────────────────────────────────────────────────────
 
 class TestGroupD_EdgeCases(unittest.TestCase):
 
@@ -263,7 +269,90 @@ class TestGroupD_EdgeCases(unittest.TestCase):
         print("✓ [13] PARTIALLY_FILLED BUY (no RM record yet) blocks entry")
 
 
-# ── Runner ─────────────────────────────────────────────────────────────────────────────────
+# ── Group E: Fail-closed safety ───────────────────────────────────────────────────────────────
+
+class TestGroupE_FailClosed(unittest.TestCase):
+
+    def test_14_expired_buy_does_not_block(self):
+        """[14] EXPIRED terminal BUY → NOT blocked.
+
+        EXPIRED is a terminal state (order fully expired at broker).  The position
+        slot is definitively free; a new entry must be allowed.
+        """
+        om = OrderManager()
+        _add_to_manager(om, _make_order(OrderSide.BUY, OrderState.EXPIRED))
+
+        blocked, reason = is_entry_blocked_by_inflight_orders(om)
+        self.assertFalse(blocked,
+            f"EXPIRED BUY is terminal and must not block entry. Reason: {reason}")
+        print("✓ [14] EXPIRED BUY does not block entry")
+
+    def test_15_multiple_inflight_buys_all_block(self):
+        """[15] Multiple in-flight BUY orders → blocked; count reported accurately.
+
+        Any one in-flight BUY is sufficient to block.  With several outstanding
+        the gate must still block and the reason string must report the correct count.
+        """
+        om = OrderManager()
+        _add_to_manager(om, _make_order(OrderSide.BUY, OrderState.SUBMITTED, "CID_SUB"))
+        _add_to_manager(om, _make_order(OrderSide.BUY, OrderState.UNKNOWN,   "CID_UNK"))
+        _add_to_manager(om, _make_order(OrderSide.BUY, OrderState.OPEN,      "CID_OPN"))
+
+        blocked, reason = is_entry_blocked_by_inflight_orders(om)
+        self.assertTrue(blocked,
+            f"Multiple in-flight BUY orders must block entry. Reason: {reason}")
+        self.assertIn("3", reason,
+            f"Reason string must report the count (3). Got: {reason}")
+        print(f"✓ [15] Multiple in-flight BUY orders block entry (count=3): {reason}")
+
+    def test_16_exception_in_get_open_orders_blocks_entry(self):
+        """[16] Exception from get_open_orders() → gate returns (True, ...) (fail-closed).
+
+        When the order store cannot be queried, the gate cannot confirm the slot is
+        free.  It must block the entry rather than silently permitting it.
+        """
+        class _FailingOrderManager:
+            def get_open_orders(self):
+                raise RuntimeError("connection lost")
+
+        blocked, reason = is_entry_blocked_by_inflight_orders(_FailingOrderManager())
+        self.assertTrue(blocked,
+            f"Exception in get_open_orders() must block entry (fail-closed). "
+            f"Got: ({blocked!r}, {reason!r})")
+        self.assertIn("gate check failed", reason,
+            f"Reason must describe the failure. Got: {reason!r}")
+        print(f"✓ [16] Exception in get_open_orders() blocks entry (fail-closed): {reason!r}")
+
+    def test_17_caller_exception_path_cannot_restore_permission(self):
+        """[17] Exception from the gate function itself → caller sets _open_count=1.
+
+        The caller in _auto_execute_loop wraps the gate call in its own try/except.
+        If the gate function raises unexpectedly (e.g. import error), that except
+        block must set _open_count=1, not leave it 0.
+
+        This test simulates the caller's pattern directly, mirroring the fix in
+        api/main.py lines 495-503: the except block must assign _open_count = 1.
+        """
+        def _gate_that_raises(_om):
+            raise ImportError("execution.entry_gate unavailable")
+
+        # Simulate the caller's try/except as it now reads after the fix.
+        _open_count = 0  # Layer 1 says no open position
+        if _open_count == 0:
+            try:
+                _blocked, _reason = _gate_that_raises(None)
+                if _blocked:
+                    _open_count = 1
+            except Exception:
+                _open_count = 1  # fail-closed — must match the fix in main.py
+
+        self.assertEqual(_open_count, 1,
+            "Caller's except block must set _open_count=1 when the gate raises "
+            "(entry must remain blocked, not authorized).")
+        print("✓ [17] Caller exception path sets _open_count=1 (fail-closed)")
+
+
+# ── Runner ──────────────────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 70)
@@ -276,7 +365,7 @@ if __name__ == "__main__":
     result = runner.run(suite)
     if result.wasSuccessful():
         print("=" * 70)
-        print("ALL 13 ONE-POSITION ENFORCEMENT TESTS [01-13] PASSED")
+        print("ALL 17 ONE-POSITION ENFORCEMENT TESTS [01-17] PASSED")
         print("=" * 70)
         sys.exit(0)
     else:

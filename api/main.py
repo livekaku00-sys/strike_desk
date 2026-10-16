@@ -471,13 +471,21 @@ async def _auto_execute_loop() -> None:
                 )
                 continue
 
-            # ── One-trade-at-a-time gate ──────────────────────────────────
+            # ── One-trade-at-a-time gate ────────────────────────────
             # If any position is currently open, collect qualifying signals
             # into the queue for visibility but do NOT execute until the slot clears.
             _open_count = int(risk_summary.get("open_positions_count", 0))
             # Layer 2: also block when a BUY entry order is in-flight but not yet
             # reflected in risk_manager (SUBMITTED/OPEN/UNKNOWN orders produce no
             # ActivePosition until the fill WebSocket callback fires).
+            #
+            # PENDING-order gap: orders placed by this loop call adapter.place_order()
+            # directly and are never registered in order_manager._orders, so their
+            # PENDING state is invisible to get_open_orders().  This is safe only
+            # because _auto_execute_loop is a single asyncio coroutine with no
+            # concurrent entry path — see execution/entry_gate.py for the full
+            # architectural note.  If a second entry path is added, PENDING orders
+            # must be tracked explicitly before this check runs.
             if _open_count == 0:
                 try:
                     from adapters.order_manager import order_manager as _om_gate
@@ -493,9 +501,16 @@ async def _auto_execute_loop() -> None:
                             _inflight_reason,
                         )
                 except Exception as _gate_exc:
-                    logger.warning("[AutoExec] in-flight gate check failed: %s", _gate_exc)
+                    # Fail-closed: if the gate itself crashes we cannot confirm the
+                    # slot is free, so treat it as occupied for this iteration.
+                    _open_count = 1
+                    logger.warning(
+                        "[AutoExec] in-flight gate check failed — blocking entry "
+                        "as safe default: %s",
+                        _gate_exc,
+                    )
 
-            # ── Collect and rank all qualifying signals ────────────────────
+            # ── Collect and rank all qualifying signals ──────────────────
             # Phase 1: class-lock filter
             _candidates = []
             for signal in _so.get_all_actionable_signals():
@@ -767,7 +782,7 @@ async def _startup_sequence(app: Optional[FastAPI] = None) -> None:
     logger.info("STRIKE DESK V4 — STARTUP SEQUENCE BEGINNING")
     logger.info("=" * 60)
 
-    # ── Step 1: Authenticate adapters ─────────────────────────────────
+    # ── Step 1: Authenticate adapters ──────────────────────────────────
     # STARTUP TIMEOUT CAP: each broker's full authenticate() call (including any
     # internal retries inside AuthManager) is limited to _STARTUP_AUTH_TIMEOUT
     # seconds.  This ensures the lifespan handler — and therefore the entire server
@@ -927,7 +942,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     """Steps 2–11: discovery, pipeline, WebSocket feeds and background loops."""
     loop = asyncio.get_running_loop()
 
-    # ── Step 2: Instrument discovery ──────────────────────────────────
+    # ── Step 2: Instrument discovery ──────────────────────────────
     _step2_t0 = time.monotonic()
     logger.info("[STARTUP] Step 2 — instrument discovery starting (elapsed %.2fs)", time.monotonic() - _startup_t0)
     discovered_symbols = list(_CORE_SYMBOLS)
@@ -975,7 +990,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     except Exception as exc:
         logger.warning("[STARTUP] ❌ Core symbol registration failed: %s", exc)
 
-    # ── Step 2c: Push per-broker equity tokens into adapters ──────────────
+    # ── Step 2c: Push per-broker equity tokens into adapters ────────────
     try:
         from services.instrument_discovery_service import instrument_discovery_service as _ids
         for _broker_name, _adapter in adapters.items():
@@ -989,7 +1004,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     except Exception as exc:
         logger.warning("[STARTUP] ❌ Equity token registration failed: %s", exc)
 
-    # ── Step 2d: Load F&O contract masters ────────────────────────────────
+    # ── Step 2d: Load F&O contract masters ───────────────────────────
     # Equity tokens alone cannot address an option, so without this every option
     # order is refused. Scoped to the underlyings actually traded.
     try:
@@ -1007,7 +1022,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     except Exception as exc:
         logger.warning("[STARTUP] ❌ F&O master load failed: %s", exc)
 
-    # ── Step 3: Initialize pipeline orchestrator ───────────────────────
+    # ── Step 3: Initialize pipeline orchestrator ─────────────────────
     _step3_t0 = time.monotonic()
     logger.info("[STARTUP] Step 3 — pipeline init (elapsed %.2fs)", time.monotonic() - _startup_t0)
     try:
@@ -1027,7 +1042,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
         except Exception as exc:
             logger.warning("[STARTUP] ❌ Tick callback wire failed for %s: %s", name, exc)
 
-    # ── Step 5: Connect WebSocket tick feeds ───────────────────────────
+    # ── Step 5: Connect WebSocket tick feeds ───────────────────────
     _step5_t0 = time.monotonic()
     logger.info("[STARTUP] Step 5 — WebSocket connect (elapsed %.2fs)", time.monotonic() - _startup_t0)
     connected_adapters = []
@@ -1047,7 +1062,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     if not connected_adapters:
         logger.warning("[STARTUP] No WebSocket connections established — no live ticks")
 
-    # ── Step 6: Initialise strategy orchestrator ───────────────────────
+    # ── Step 6: Initialise strategy orchestrator ─────────────────────
     try:
         from strategies.strategy_orchestrator import strategy_orchestrator
         if hasattr(strategy_orchestrator, "initialize"):
@@ -1057,7 +1072,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     except Exception as exc:
         logger.error("[STARTUP] ❌ Strategy orchestrator init failed: %s", exc)
 
-    # ── Step 7: PCR background fetch loop ─────────────────────────────
+    # ── Step 7: PCR background fetch loop ─────────────────────────
     dhan_adapter = adapters.get("dhan")
     if dhan_adapter:
         asyncio.create_task(
@@ -1068,7 +1083,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     else:
         logger.warning("[STARTUP] ⚠️  No Dhan adapter — PCR fetch loop not started")
 
-    # ── Step 8: AngelOne 23h auto-refresh loop ────────────────────────
+    # ── Step 8: AngelOne 23h auto-refresh loop ────────────────────
     angel_adapter = adapters.get("angelone")
     if angel_adapter:
         asyncio.create_task(
@@ -1079,11 +1094,11 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     else:
         logger.warning("[STARTUP] ⚠️  No AngelOne adapter — auto-refresh loop not started")
 
-    # ── Step 9: Auto-execute background loop ──────────────────────────
+    # ── Step 9: Auto-execute background loop ──────────────────────
     asyncio.create_task(_auto_execute_loop(), name="auto_execute_loop")
     logger.info("[STARTUP] ✅ Auto-execute loop started (5s interval, market hours only)")
 
-    # ── Step 10: Token refresh scheduler ──────────────────────────────
+    # ── Step 10: Token refresh scheduler ───────────────────────────
     # AngelOne: TOTP refresh at 06:00 IST via adapter.authenticate().
     # Dhan/Fyers: monitor-and-block — logs CRITICAL if expiring, blocks
     # LIVE MODE arming if expired. No portal scraping (C4).
@@ -1128,7 +1143,7 @@ async def _startup_pipeline(adapters: Dict[str, Any], _startup_t0: float) -> Non
     except Exception as exc:
         logger.error("[STARTUP] ❌ Pre-flight scheduler failed to start: %s", exc)
 
-    # ── Done ───────────────────────────────────────────────────────────
+    # ── Done ───────────────────────────────────────────────────
     _total_startup_s = time.monotonic() - _startup_t0
     logger.info("=" * 60)
     pipeline_ok = connected_adapters or True
